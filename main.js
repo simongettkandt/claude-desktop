@@ -4,7 +4,30 @@ const path = require('path');
 // Force dark mode
 nativeTheme.themeSource = 'dark';
 
+const isDev = !app.isPackaged;
+
 let mainWindow;
+
+// Sichere Domain-Prüfung
+function isAllowedDomain(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === 'claude.ai' || parsed.hostname.endsWith('.claude.ai');
+  } catch {
+    return false;
+  }
+}
+
+function isGoogleAuthDomain(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === 'accounts.google.com' ||
+           parsed.hostname === 'www.google.com' ||
+           parsed.hostname === 'oauth2.googleapis.com';
+  } catch {
+    return false;
+  }
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -15,13 +38,11 @@ function createWindow() {
     title: 'Claude Desktop',
     icon: path.join(__dirname, 'icon.png'),
     backgroundColor: '#0f0f0f',
-    // Kein focusable-Lock oder always-on-top
     alwaysOnTop: false,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false,
-      // Wichtig für Google OAuth: Popups und neue Fenster erlauben
+      sandbox: true,
       nativeWindowOpen: true,
       allowRunningInsecureContent: false
     }
@@ -38,7 +59,7 @@ function createWindow() {
   // Google OAuth Popups korrekt behandeln
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     // Google Auth URLs im eigenen Fenster öffnen
-    if (url.includes('accounts.google.com') || url.includes('google.com/o/oauth')) {
+    if (isGoogleAuthDomain(url)) {
       return {
         action: 'allow',
         overrideBrowserWindowOptions: {
@@ -50,34 +71,37 @@ function createWindow() {
           webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: false
+            sandbox: true
           }
         }
       };
     }
 
     // Andere Claude-URLs im Hauptfenster
-    if (url.startsWith('https://claude.ai')) {
+    if (isAllowedDomain(url)) {
       return { action: 'allow' };
     }
 
-    // Alles andere im System-Browser
-    shell.openExternal(url);
+    // Nur https-URLs im System-Browser öffnen
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'https:') {
+        shell.openExternal(url);
+      }
+    } catch {}
     return { action: 'deny' };
   });
 
   // Auch neue WebContents (OAuth-Fenster) brauchen den Chrome User-Agent
   app.on('web-contents-created', (event, contents) => {
     contents.setUserAgent(chromeUA);
-    
-    // OAuth Redirects zurück zu Claude erlauben
+
+    // Navigation nur zu erlaubten Domains zulassen
     contents.on('will-navigate', (event, url) => {
-      if (url.startsWith('https://claude.ai') || 
-          url.includes('accounts.google.com') ||
-          url.includes('google.com')) {
-        // Erlauben
+      if (isAllowedDomain(url) || isGoogleAuthDomain(url)) {
         return;
       }
+      event.preventDefault();
     });
   });
 
@@ -100,6 +124,11 @@ function createWindow() {
       /* Smooth transitions */
       * { scroll-behavior: smooth; }
     `);
+  });
+
+  // Fix: Fokus korrekt abgeben wenn Fenster nicht aktiv
+  mainWindow.on('blur', () => {
+    mainWindow.webContents.executeJavaScript('document.activeElement?.blur()');
   });
 
   mainWindow.on('closed', () => {
@@ -143,8 +172,10 @@ function createMenu() {
         { role: 'zoomOut', label: 'Verkleinern' },
         { type: 'separator' },
         { role: 'togglefullscreen', label: 'Vollbild' },
-        { type: 'separator' },
-        { role: 'toggleDevTools', label: 'Entwicklertools' }
+        ...(isDev ? [
+          { type: 'separator' },
+          { role: 'toggleDevTools', label: 'Entwicklertools' }
+        ] : [])
       ]
     },
     {
@@ -160,7 +191,6 @@ function createMenu() {
 }
 
 app.whenReady().then(() => {
-  // Partition für persistente Sessions (bleibt eingeloggt)
   createWindow();
   createMenu();
 
