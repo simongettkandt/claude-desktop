@@ -1,30 +1,45 @@
 {
   "name": "claude-desktop",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Claude AI – Native Desktop App für Linux",
   "main": "main.js",
-  "homepage": "https://github.com/simon-gettkandt/claude-desktop",
+  "homepage": "https://github.com/simongettkandt/claude-desktop",
   "author": {
     "name": "Simon Gettkandt",
     "email": "simon@gettkandt.de"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/simongettkandt/claude-desktop.git"
+  },
   "scripts": {
     "start": "electron .",
     "build": "electron-builder --linux",
-    "build-deb": "electron-builder --linux deb",
-    "build-appimage": "electron-builder --linux AppImage"
+    "build-appimage": "electron-builder --linux AppImage",
+    "build-deb": "electron-builder --linux deb"
   },
   "build": {
     "appId": "com.claude.desktop",
     "productName": "Claude Desktop",
+    "publish": {
+      "provider": "github",
+      "owner": "simongettkandt",
+      "repo": "claude-desktop"
+    },
     "linux": {
-      "target": ["deb"],
+      "target": ["AppImage"],
       "icon": "icon.png",
       "category": "Utility",
       "synopsis": "Claude AI Desktop Client",
       "description": "Eine schnelle, native Desktop-App für Claude AI",
       "maintainer": "Simon Gettkandt"
+    },
+    "appImage": {
+      "artifactName": "Claude-Desktop-${version}.AppImage"
     }
+  },
+  "dependencies": {
+    "electron-updater": "^6.1.0"
   },
   "devDependencies": {
     "electron": "^31.0.0",
