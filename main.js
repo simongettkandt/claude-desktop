@@ -20,7 +20,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false,
+      sandbox: true,
       // Wichtig für Google OAuth: Popups und neue Fenster erlauben
       nativeWindowOpen: true,
       allowRunningInsecureContent: false
@@ -50,7 +50,7 @@ function createWindow() {
           webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: false
+            sandbox: true
           }
         }
       };
