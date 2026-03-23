@@ -3,7 +3,7 @@
 # Findet und startet das AppImage automatisch
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APPIMAGE="$SCRIPT_DIR/Claude-Desktop-1.1.1.AppImage"
+APPIMAGE="$SCRIPT_DIR/Claude-Desktop-1.1.3.AppImage"
 
 # Sprache erkennen (de = Deutsch, sonst Englisch)
 LANG_PREFIX="${LANG%%_*}"

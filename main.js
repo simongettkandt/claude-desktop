@@ -3,6 +3,9 @@ const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
 
+// ── Electron Security-Warnings nur im Dev-Modus ──
+if (app.isPackaged) process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
+
 // ── Performance-Flags ──
 app.commandLine.appendSwitch('enable-gpu-rasterization');
 app.commandLine.appendSwitch('enable-zero-copy');
@@ -19,7 +22,12 @@ if (!app.requestSingleInstanceLock()) { app.quit(); }
 const isDev = !app.isPackaged;
 const chromeUA = `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36`;
 const TAB_BAR_HEIGHT = 40;
-const PRELOAD_POOL_SIZE = 2;
+const PRELOAD_POOL_SIZE = 1;
+const RELOAD_DELAY_MS = 300;
+const MAX_CRASH_RELOADS = 3;
+const ONLINE_CHECK_INTERVAL_MS = 60_000;
+const UPDATE_CHECK_INTERVAL_MS = 3_600_000;
+const DOMAIN_CACHE_MAX = 50;
 
 let mainWindow;
 let tabs = [];
@@ -30,6 +38,9 @@ let isDarkMode = true;
 
 // ── Tab-Preload-Pool ──
 const viewPool = [];
+
+// ── Crash-Counter (max Reloads pro Tab) ──
+const crashCounts = new WeakMap();
 
 // ── Debounce/Throttle ──
 function debounce(fn, ms) {
@@ -53,20 +64,25 @@ const stateFile = path.join(app.getPath('userData'), 'window-state.json');
 function loadWindowState() {
   try {
     if (fs.existsSync(stateFile)) windowState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-  } catch {}
+  } catch (e) { if (isDev) console.debug('Window-State laden fehlgeschlagen:', e.message); }
   return {
     width: windowState.width || 1200, height: windowState.height || 800,
     x: windowState.x, y: windowState.y, isMaximized: windowState.isMaximized || false
   };
 }
 
+let lastSavedState = '';
 const saveWindowState = debounce(() => {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   try {
     const bounds = mainWindow.getBounds();
-    windowState = { ...bounds, isMaximized: mainWindow.isMaximized() };
-    fs.writeFileSync(stateFile, JSON.stringify(windowState));
-  } catch {}
+    const newState = { ...bounds, isMaximized: mainWindow.isMaximized() };
+    const json = JSON.stringify(newState);
+    if (json === lastSavedState) return;
+    lastSavedState = json;
+    windowState = newState;
+    fs.writeFileSync(stateFile, json);
+  } catch (e) { if (isDev) console.debug('Window-State speichern fehlgeschlagen:', e.message); }
 }, 500);
 
 // ── Domain-Prüfung ──
@@ -77,14 +93,12 @@ function isAllowedDomain(url) {
   if (r !== undefined) return r;
   try { const h = new URL(url).hostname; r = h === 'claude.ai' || h.endsWith('.claude.ai'); }
   catch { r = false; }
-  if (domainCache.size > 200) domainCache.clear();
+  if (domainCache.size >= DOMAIN_CACHE_MAX) {
+    // Ältesten Eintrag entfernen (Map behält Einfügereihenfolge)
+    domainCache.delete(domainCache.keys().next().value);
+  }
   domainCache.set(url, r);
   return r;
-}
-
-function isGoogleAuthDomain(url) {
-  try { const h = new URL(url).hostname; return h === 'accounts.google.com' || h === 'oauth2.googleapis.com'; }
-  catch { return false; }
 }
 
 // OAuth-Domains für Konnektoren (GitHub, Google Drive, etc.)
@@ -120,7 +134,9 @@ function drainPool() {
 // ── Tab-Bar HTML ──
 function getTabBarHTML() {
   const t = currentTheme();
-  return `<!DOCTYPE html><html><head><style>
+  return `<!DOCTYPE html><html><head>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <style>
   :root{--bg:${t.bg};--bgh:${t.bgHover};--bga:${t.bgActive};--t:${t.text};--ta:${t.textActive};--ac:#d4734c;--bd:${t.border}}
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:var(--bg);font:500 12px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
@@ -157,8 +173,7 @@ function getTabBarHTML() {
     </div>
   </div>
 <script>
-  const tabsEl=document.getElementById('tabs'),escDiv=document.createElement('div');
-  function esc(t){escDiv.textContent=t;return escDiv.innerHTML}
+  const tabsEl=document.getElementById('tabs');
   let tabEls=[];
   document.getElementById('new-tab').addEventListener('click',()=>window.tabAPI.newTab());
   document.getElementById('theme-toggle').addEventListener('click',()=>window.tabAPI.toggleTheme());
@@ -178,8 +193,8 @@ function getTabBarHTML() {
         });
         tabsEl.appendChild(el);tabEls.push(el);
       }
-      const ts=el.firstChild,t=esc(data.tabs[i].title);
-      if(ts.innerHTML!==t)ts.innerHTML=t;
+      const ts=el.firstChild,t=data.tabs[i].title;
+      if(ts.textContent!==t)ts.textContent=t;
       const a=i===data.activeIndex;
       if(el.classList.contains('active')!==a)el.classList.toggle('active',a);
       el.lastChild.style.display=c>1?'':'none';
@@ -298,19 +313,24 @@ function setupView(view) {
   // OAuth-Popups: Navigation innerhalb des Popup-Fensters erlauben
   // (OAuth redirected zwischen Domains hin und her)
   wc.on('did-create-window', (childWindow) => {
-    childWindow.webContents.on('will-navigate', (event, navUrl) => {
-      // Im OAuth-Popup: Navigation zu OAuth-Domains und zurück zu claude.ai erlauben
+    const onNavigate = (event, navUrl) => {
       if (!isOAuthDomain(navUrl) && !isAllowedDomain(navUrl)) {
         try {
           const p = new URL(navUrl).protocol;
           if (p !== 'https:' && p !== 'http:') event.preventDefault();
         } catch { event.preventDefault(); }
       }
-    });
-    // Wenn OAuth fertig ist und zu claude.ai redirected → Popup schließen
-    childWindow.webContents.on('will-redirect', (event, navUrl) => {
-      if (isAllowedDomain(navUrl)) {
-        childWindow.close();
+    };
+    const onRedirect = (_event, navUrl) => {
+      if (isAllowedDomain(navUrl)) childWindow.close();
+    };
+    childWindow.webContents.on('will-navigate', onNavigate);
+    childWindow.webContents.on('will-redirect', onRedirect);
+    // Cleanup: Listener entfernen wenn Popup geschlossen wird
+    childWindow.once('closed', () => {
+      if (!childWindow.webContents.isDestroyed()) {
+        childWindow.webContents.removeListener('will-navigate', onNavigate);
+        childWindow.webContents.removeListener('will-redirect', onRedirect);
       }
     });
   });
@@ -331,8 +351,14 @@ function setupView(view) {
 
   wc.on('render-process-gone', (_, details) => {
     if (details.reason !== 'clean-exit' && !wc.isDestroyed()) {
-      console.error(`Tab crashed (${details.reason}), reloading...`);
-      setTimeout(() => { if (!wc.isDestroyed()) wc.reload(); }, 300);
+      const count = (crashCounts.get(wc) || 0) + 1;
+      crashCounts.set(wc, count);
+      if (count > MAX_CRASH_RELOADS) {
+        console.error(`Tab crashed ${count}x (${details.reason}), giving up.`);
+        return;
+      }
+      console.error(`Tab crashed (${details.reason}), reload ${count}/${MAX_CRASH_RELOADS}...`);
+      setTimeout(() => { if (!wc.isDestroyed()) wc.reload(); }, RELOAD_DELAY_MS);
     }
   });
 }
@@ -353,21 +379,24 @@ function createBrowserView() {
 }
 
 // ── Tab-Pool: Hält fertig geladene Views bereit ──
+let isPoolRefilling = false;
+
 function fillPool() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  isPoolRefilling = true;
   while (viewPool.length < PRELOAD_POOL_SIZE) {
     const view = createBrowserView();
     setupView(view);
     view.webContents.loadURL('https://claude.ai');
     viewPool.push(view);
   }
+  isPoolRefilling = false;
 }
 
 function getPooledView() {
   if (viewPool.length > 0) {
     const view = viewPool.shift();
-    // Pool sofort nachfüllen
-    setImmediate(fillPool);
+    if (!isPoolRefilling) setImmediate(fillPool);
     return view;
   }
   return null;
@@ -394,8 +423,10 @@ function createTab(url = 'https://claude.ai') {
 }
 
 function switchToTab(index) {
-  if (index < 0 || index >= tabs.length || !mainWindow) return;
-  if (index === activeTabIndex && mainWindow.getBrowserView() === tabs[index].view) {
+  if (index < 0 || index >= tabs.length || !mainWindow || mainWindow.isDestroyed()) return;
+  const targetView = tabs[index].view;
+  if (targetView.webContents.isDestroyed()) return;
+  if (index === activeTabIndex && mainWindow.getBrowserView() === targetView) {
     sendTabsUpdate();
     return;
   }
@@ -404,9 +435,9 @@ function switchToTab(index) {
   if (prev && !prev.webContents.isDestroyed()) prev.webContents.setBackgroundThrottling(true);
 
   activeTabIndex = index;
-  const cur = tabs[index].view;
-  mainWindow.setBrowserView(cur);
-  if (!cur.webContents.isDestroyed()) cur.webContents.setBackgroundThrottling(false);
+  mainWindow.setBrowserView(targetView);
+  targetView.webContents.setBackgroundThrottling(false);
+  lastViewBounds = ''; // Force resize nach Tab-Wechsel
   resizeActiveView();
   updateTitle();
   updateMenu();
@@ -414,7 +445,7 @@ function switchToTab(index) {
 }
 
 function closeTab(index) {
-  if (tabs.length <= 1) return;
+  if (tabs.length <= 1 || index < 0 || index >= tabs.length) return;
   const tab = tabs[index];
   mainWindow.removeBrowserView(tab.view);
 
@@ -434,9 +465,13 @@ function closeTab(index) {
   sendTabsUpdate();
 }
 
+let lastViewBounds = '';
 const resizeActiveView = throttle(() => {
   if (!mainWindow || mainWindow.isDestroyed() || !tabs[activeTabIndex]) return;
   const b = mainWindow.getContentBounds();
+  const key = `${b.width}:${b.height}`;
+  if (key === lastViewBounds) return;
+  lastViewBounds = key;
   tabs[activeTabIndex].view.setBounds({ x: 0, y: TAB_BAR_HEIGHT, width: b.width, height: b.height - TAB_BAR_HEIGHT });
 }, 16);
 
@@ -467,7 +502,9 @@ function handleOnlineChange(online) {
 
 function showOfflinePage() {
   if (!tabs[activeTabIndex]) return;
-  tabs[activeTabIndex].view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(`<!DOCTYPE html><html><head><style>
+  tabs[activeTabIndex].view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(`<!DOCTYPE html><html><head>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+    <style>
     body{background:#171310;color:#e8e0d8;font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0}
     h1{font-size:22px;font-weight:600;margin-bottom:8px}
     p{color:#8a7e72;font-size:14px;max-width:360px;text-align:center;line-height:1.6}
@@ -481,7 +518,7 @@ function showOfflinePage() {
 
 // ── Downloads ──
 function setupDownloadManager() {
-  session.defaultSession.on('will-download', (_, item) => {
+  session.fromPartition('persist:claude').on('will-download', (_, item) => {
     const fileName = item.getFilename();
     const savePath = dialog.showSaveDialogSync(mainWindow, {
       defaultPath: path.join(app.getPath('downloads'), fileName),
@@ -530,9 +567,18 @@ function setupAutoUpdater() {
       buttons: ['Neu starten', 'Sp\u00e4ter'], defaultId: 0
     }) === 0) autoUpdater.quitAndInstall();
   });
-  autoUpdater.on('error', (err) => console.error('Update-Fehler:', err.message));
+  let updateFailures = 0;
+  autoUpdater.on('error', (err) => {
+    updateFailures++;
+    console.error(`Update-Fehler (${updateFailures}x):`, err.message);
+  });
+  autoUpdater.on('update-available', () => { updateFailures = 0; });
   autoUpdater.checkForUpdates().catch(() => {});
-  setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 3600000);
+  setInterval(() => {
+    // Exponential Backoff: nach 3 Fehlern nur noch jede 2./4./8. Stunde prüfen
+    if (updateFailures > 3) { updateFailures = 0; return; }
+    autoUpdater.checkForUpdates().catch(() => {});
+  }, UPDATE_CHECK_INTERVAL_MS);
 }
 
 // ── Session-Optimierung ──
@@ -551,12 +597,17 @@ function optimizeSession() {
 
   // Preconnect bei Session-Start
   ses.preconnect({ url: 'https://claude.ai', numSockets: 4 });
+  ses.preconnect({ url: 'https://cdn.claude.ai', numSockets: 2 });
 }
 
 // ── IPC ──
 ipcMain.on('tab-new', () => createTab());
-ipcMain.on('tab-switch', (_, i) => switchToTab(i));
-ipcMain.on('tab-close', (_, i) => closeTab(i));
+ipcMain.on('tab-switch', (_, i) => {
+  if (typeof i === 'number' && Number.isInteger(i) && i >= 0 && i < tabs.length) switchToTab(i);
+});
+ipcMain.on('tab-close', (_, i) => {
+  if (typeof i === 'number' && Number.isInteger(i) && i >= 0 && i < tabs.length) closeTab(i);
+});
 ipcMain.on('theme-toggle', () => {
   isDarkMode = !isDarkMode;
   // 1) Pool-Views zerstören – die würden sonst im gleichen Renderer mit re-rendern
@@ -573,8 +624,8 @@ ipcMain.on('theme-toggle', () => {
   for (const tab of tabs) {
     if (tab.view !== active && !tab.view.webContents.isDestroyed()) tab.view.setBackgroundColor(bg);
   }
-  // 6) Pool nach Delay neu füllen (im neuen Theme)
-  setTimeout(fillPool, 2000);
+  // 6) Pool neu füllen sobald Event-Loop frei ist (im neuen Theme)
+  setImmediate(fillPool);
 });
 
 // ── Fenster ──
@@ -587,7 +638,7 @@ function createWindow() {
     backgroundColor: currentTheme().bg,
     show: false,
     webPreferences: {
-      nodeIntegration: false, contextIsolation: true, sandbox: false,
+      nodeIntegration: false, contextIsolation: true, sandbox: true,
       preload: path.join(__dirname, 'preload-tabbar.js'),
       backgroundThrottling: false,
       spellcheck: false,
@@ -601,11 +652,10 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
-  mainWindow.on('resize', saveWindowState);
+  mainWindow.on('resize', () => { saveWindowState(); resizeActiveView(); });
   mainWindow.on('move', saveWindowState);
   mainWindow.on('maximize', saveWindowState);
   mainWindow.on('unmaximize', saveWindowState);
-  mainWindow.on('resize', resizeActiveView);
 
   mainWindow.on('blur', () => {
     const v = tabs[activeTabIndex]?.view;
@@ -623,9 +673,11 @@ function createWindow() {
   });
 
   mainWindow.webContents.once('did-finish-load', () => {
-    createTab('https://claude.ai');
-    // Pool nach erstem Tab füllen (sofort, nicht warten)
-    setTimeout(fillPool, 500);
+    const tab = createTab('https://claude.ai');
+    // Pool erst füllen wenn der erste Tab fertig geladen hat (spart Bandbreite/CPU beim Start)
+    if (tab) {
+      tab.view.webContents.once('did-finish-load', () => setImmediate(fillPool));
+    }
   });
 }
 
@@ -641,7 +693,7 @@ app.whenReady().then(() => {
   setupDownloadManager();
   setupAutoUpdater();
   handleOnlineChange(net.isOnline());
-  setInterval(() => handleOnlineChange(net.isOnline()), 60000);
+  setInterval(() => handleOnlineChange(net.isOnline()), ONLINE_CHECK_INTERVAL_MS);
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
@@ -652,6 +704,6 @@ app.on('before-quit', () => {
       const bounds = mainWindow.getBounds();
       windowState = { ...bounds, isMaximized: mainWindow.isMaximized() };
       fs.writeFileSync(stateFile, JSON.stringify(windowState));
-    } catch {}
+    } catch (e) { if (isDev) console.debug('Window-State bei Quit fehlgeschlagen:', e.message); }
   }
 });
