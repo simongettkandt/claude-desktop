@@ -12,5 +12,6 @@ contextBridge.exposeInMainWorld('tabAPI', {
   switchTab: (i) => { if (validIndex(i)) ipcRenderer.send('tab-switch', i); },
   closeTab: (i) => { if (validIndex(i)) ipcRenderer.send('tab-close', i); },
   toggleTheme: () => ipcRenderer.send('theme-toggle'),
-  toggleDesign: () => ipcRenderer.send('design-toggle')
+  toggleDesign: () => ipcRenderer.send('design-toggle'),
+  bugReport: () => ipcRenderer.send('bug-report')
 });

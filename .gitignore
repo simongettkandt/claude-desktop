@@ -1,2 +1,7 @@
 node_modules/
 dist/
+*.snap
+parts/
+prime/
+stage/
+snap/local/

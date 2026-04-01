@@ -2,64 +2,57 @@ const { app, BrowserWindow, WebContentsView, shell, Menu, nativeTheme, dialog, N
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
-const fsp = require('fs/promises');
 
-// ── Electron Security-Warnings nur im Dev-Modus ──
-if (app.isPackaged) process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
-
-// ── Electron Error-Dialog auf JS-Ebene abfangen ──
-// Electron zeigt "Object has been destroyed" bei OAuth-Popup-Close über dialog.showErrorBox.
-// Wir patchen die Funktion direkt, weil process.on('uncaughtException') zu spät greift.
+// ── Electron "Object has been destroyed" Error-Dialog abfangen ──
 const _origErrorBox = dialog.showErrorBox;
 dialog.showErrorBox = (title, content) => {
   if (typeof content === 'string' && content.includes('Object has been destroyed')) return;
   _origErrorBox(title, content);
 };
 
-// ── Performance-Flags (Chromium 134+) ──
-// GPU-Rasterization, zero-copy, smooth-scrolling, VaapiVideoDecoder: alles Standard seit Chromium ~130
-// AcceleratedVideoEncoder (ex VaapiVideoEncoder): noch nicht Standard auf Linux
-app.commandLine.appendSwitch('enable-features', 'AcceleratedVideoEncoder');
-app.commandLine.appendSwitch('disk-cache-size', '209715200');
-app.commandLine.appendSwitch('force-color-profile', 'srgb');
-
-// nativeTheme wird nach loadWindowState() gesetzt (s. createWindow)
+if (app.isPackaged) process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
 
 // ── Single Instance ──
 if (!app.requestSingleInstanceLock()) { app.quit(); }
 
+// ═══════════════════════════════════════════════════════════════════
+//  Konstanten
+// ═══════════════════════════════════════════════════════════════════
+
 const isDev = !app.isPackaged;
 const chromeUA = `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36`;
+
 const TAB_BAR_HEIGHT = 40;
-const PRELOAD_POOL_SIZE = 1;
-const RELOAD_DELAY_MS = 300;
+const POOL_SIZE = 0;
 const MAX_CRASH_RELOADS = 3;
-const ONLINE_CHECK_INTERVAL_MS = 60_000;
-const UPDATE_CHECK_INTERVAL_MS = 3_600_000;
+const ONLINE_CHECK_MS = 60_000;
+const UPDATE_CHECK_MS = 3_600_000;
 const DOMAIN_CACHE_MAX = 50;
 
-let mainWindow;
+// ═══════════════════════════════════════════════════════════════════
+//  Injected Scripts (aus Dateien geladen)
+// ═══════════════════════════════════════════════════════════════════
+
+const BRAND_SCRIPT = fs.readFileSync(path.join(__dirname, 'inject', 'brand.js'), 'utf8');
+
+// ═══════════════════════════════════════════════════════════════════
+//  State
+// ═══════════════════════════════════════════════════════════════════
+
+let mainWindow = null;
 let tabs = [];
 let activeTabIndex = 0;
 let isOnline = true;
-let windowState = {};
 let isDarkMode = true;
 let customDesign = true;
 
-// ── Lokalisierung (DE/EN) ──
-const isDE = (() => {
-  const l = (process.env.LANG || process.env.LANGUAGE || '').toLowerCase();
-  return l.startsWith('de');
-})();
-function t(de, en) { return isDE ? de : en; }
-
-// ── Tab-Preload-Pool ──
+// Tab-Pool (vorgeladene Views)
 const viewPool = [];
 
-// ── Crash-Counter (max Reloads pro Tab) ──
-const crashCounts = new WeakMap();
+// ═══════════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════════
 
-// ── Debounce/Throttle ──
 function debounce(fn, ms) {
   let timer;
   return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
@@ -75,13 +68,94 @@ function throttle(fn, ms) {
   };
 }
 
-// ── Fensterzustand ──
+// Sicherer WebContents-Zugriff
+function alive(viewOrWc) {
+  if (!viewOrWc) return false;
+  const wc = viewOrWc.webContents || viewOrWc;
+  return wc && !wc.isDestroyed();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  i18n (multi-language)
+// ═══════════════════════════════════════════════════════════════════
+
+const sysLang = (() => {
+  const l = (process.env.LANG || process.env.LANGUAGE || '').toLowerCase();
+  if (l.startsWith('de')) return 'de';
+  if (l.startsWith('fr')) return 'fr';
+  if (l.startsWith('es')) return 'es';
+  if (l.startsWith('pt')) return 'pt';
+  if (l.startsWith('it')) return 'it';
+  if (l.startsWith('nl')) return 'nl';
+  if (l.startsWith('pl')) return 'pl';
+  if (l.startsWith('ru')) return 'ru';
+  if (l.startsWith('ja')) return 'ja';
+  if (l.startsWith('ko')) return 'ko';
+  if (l.startsWith('zh')) return 'zh';
+  if (l.startsWith('tr')) return 'tr';
+  if (l.startsWith('ar')) return 'ar';
+  if (l.startsWith('sv')) return 'sv';
+  if (l.startsWith('da')) return 'da';
+  if (l.startsWith('no') || l.startsWith('nb') || l.startsWith('nn')) return 'no';
+  if (l.startsWith('fi')) return 'fi';
+  if (l.startsWith('cs')) return 'cs';
+  if (l.startsWith('uk')) return 'uk';
+  if (l.startsWith('hu')) return 'hu';
+  if (l.startsWith('ro')) return 'ro';
+  if (l.startsWith('el')) return 'el';
+  if (l.startsWith('hi')) return 'hi';
+  if (l.startsWith('th')) return 'th';
+  if (l.startsWith('vi')) return 'vi';
+  if (l.startsWith('id') || l.startsWith('ms')) return 'id';
+  return 'en';
+})();
+
+const isDE = sysLang === 'de';
+function t(de, en) { return isDE ? de : en; }
+
+// Lokalisierte Strings für den Bug-Report-Dialog
+const bugReportStrings = {
+  en: { title: 'Report a Bug', body: 'Found a bug or have a suggestion?\nPlease send an email to:', btn: 'Copy Email', copied: 'Copied!' },
+  de: { title: 'Fehler melden', body: 'Einen Fehler gefunden oder einen Vorschlag?\nBitte sende eine E-Mail an:', btn: 'E-Mail kopieren', copied: 'Kopiert!' },
+  fr: { title: 'Signaler un bug', body: 'Vous avez trouv\u00e9 un bug ou une suggestion ?\nVeuillez envoyer un e-mail \u00e0 :', btn: 'Copier l\u2019e-mail', copied: 'Copi\u00e9 !' },
+  es: { title: 'Reportar un error', body: '\u00bfEncontraste un error o tienes una sugerencia?\nEnv\u00eda un correo a:', btn: 'Copiar correo', copied: '\u00a1Copiado!' },
+  pt: { title: 'Reportar um bug', body: 'Encontrou um bug ou tem uma sugest\u00e3o?\nEnvie um e-mail para:', btn: 'Copiar e-mail', copied: 'Copiado!' },
+  it: { title: 'Segnala un bug', body: 'Hai trovato un bug o un suggerimento?\nInvia un\u2019email a:', btn: 'Copia email', copied: 'Copiato!' },
+  nl: { title: 'Bug melden', body: 'Een bug gevonden of een suggestie?\nStuur een e-mail naar:', btn: 'E-mail kopi\u00ebren', copied: 'Gekopieerd!' },
+  pl: { title: 'Zg\u0142o\u015b b\u0142\u0105d', body: 'Znalaz\u0142e\u015b b\u0142\u0105d lub masz sugesti\u0119?\nWy\u015blij e-mail na:', btn: 'Kopiuj e-mail', copied: 'Skopiowano!' },
+  ru: { title: '\u0421\u043e\u043e\u0431\u0449\u0438\u0442\u044c \u043e\u0431 \u043e\u0448\u0438\u0431\u043a\u0435', body: '\u041d\u0430\u0448\u043b\u0438 \u043e\u0448\u0438\u0431\u043a\u0443 \u0438\u043b\u0438 \u0435\u0441\u0442\u044c \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u0435?\n\u041e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u043f\u0438\u0441\u044c\u043c\u043e \u043d\u0430:', btn: '\u041a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c', copied: '\u0421\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d\u043e!' },
+  ja: { title: '\u30d0\u30b0\u3092\u5831\u544a', body: '\u30d0\u30b0\u3084\u63d0\u6848\u304c\u3042\u308a\u307e\u3059\u304b\uff1f\n\u4ee5\u4e0b\u306b\u30e1\u30fc\u30eb\u3092\u304a\u9001\u308a\u304f\u3060\u3055\u3044\uff1a', btn: '\u30e1\u30fc\u30eb\u3092\u30b3\u30d4\u30fc', copied: '\u30b3\u30d4\u30fc\u3057\u307e\u3057\u305f\uff01' },
+  ko: { title: '\ubc84\uadf8 \uc2e0\uace0', body: '\ubc84\uadf8\ub97c \ubc1c\uacac\ud588\uac70\ub098 \uc81c\uc548\uc774 \uc788\uc73c\uc2e0\uac00\uc694?\n\ub2e4\uc74c \uc8fc\uc18c\ub85c \uc774\uba54\uc77c\uc744 \ubcf4\ub0b4\uc8fc\uc138\uc694:', btn: '\uc774\uba54\uc77c \ubcf5\uc0ac', copied: '\ubcf5\uc0ac\ub428!' },
+  zh: { title: '\u62a5\u544a\u9519\u8bef', body: '\u53d1\u73b0\u4e86\u9519\u8bef\u6216\u6709\u5efa\u8bae\uff1f\n\u8bf7\u53d1\u9001\u7535\u5b50\u90ae\u4ef6\u81f3\uff1a', btn: '\u590d\u5236\u90ae\u7bb1', copied: '\u5df2\u590d\u5236\uff01' },
+  tr: { title: 'Hata bildir', body: 'Bir hata m\u0131 buldunuz veya bir \u00f6neriniz mi var?\nL\u00fctfen e-posta g\u00f6nderin:', btn: 'E-postay\u0131 kopyala', copied: 'Kopyaland\u0131!' },
+  ar: { title: '\u0627\u0644\u0625\u0628\u0644\u0627\u063a \u0639\u0646 \u062e\u0637\u0623', body: '\u0648\u062c\u062f\u062a \u062e\u0637\u0623 \u0623\u0648 \u0644\u062f\u064a\u0643 \u0627\u0642\u062a\u0631\u0627\u062d\u061f\n\u0627\u0644\u0631\u062c\u0627\u0621 \u0625\u0631\u0633\u0627\u0644 \u0628\u0631\u064a\u062f \u0625\u0644\u0643\u062a\u0631\u043e\u0646\u0438 \u0625\u0644\u0649:', btn: '\u0646\u0633\u062e \u0627\u0644\u0628\u0631\u064a\u062f', copied: '\u062a\u0645 \u0627\u0644\u0646\u0633\u062e!' },
+  sv: { title: 'Rapportera en bugg', body: 'Hittat en bugg eller har ett f\u00f6rslag?\nSkicka ett e-postmeddelande till:', btn: 'Kopiera e-post', copied: 'Kopierat!' },
+  da: { title: 'Rapport\u00e9r en fejl', body: 'Fundet en fejl eller har et forslag?\nSend en e-mail til:', btn: 'Kopi\u00e9r e-mail', copied: 'Kopieret!' },
+  no: { title: 'Rapporter en feil', body: 'Funnet en feil eller har et forslag?\nSend en e-post til:', btn: 'Kopier e-post', copied: 'Kopiert!' },
+  fi: { title: 'Ilmoita virheest\u00e4', body: 'L\u00f6ysitkö virheen tai onko sinulla ehdotus?\nL\u00e4het\u00e4 s\u00e4hk\u00f6posti osoitteeseen:', btn: 'Kopioi s\u00e4hk\u00f6posti', copied: 'Kopioitu!' },
+  cs: { title: 'Nahl\u00e1sit chybu', body: 'Na\u0161li jste chybu nebo m\u00e1te n\u00e1vrh?\nPo\u0161lete e-mail na:', btn: 'Kop\u00edrovat e-mail', copied: 'Zkop\u00edrov\u00e1no!' },
+  uk: { title: '\u041f\u043e\u0432\u0456\u0434\u043e\u043c\u0438\u0442\u0438 \u043f\u0440\u043e \u043f\u043e\u043c\u0438\u043b\u043a\u0443', body: '\u0417\u043d\u0430\u0439\u0448\u043b\u0438 \u043f\u043e\u043c\u0438\u043b\u043a\u0443 \u0430\u0431\u043e \u043c\u0430\u0454\u0442\u0435 \u043f\u0440\u043e\u043f\u043e\u0437\u0438\u0446\u0456\u044e?\n\u041d\u0430\u0434\u0456\u0448\u043b\u0456\u0442\u044c \u043b\u0438\u0441\u0442\u0430 \u043d\u0430:', btn: '\u041a\u043e\u043f\u0456\u044e\u0432\u0430\u0442\u0438', copied: '\u0421\u043a\u043e\u043f\u0456\u0439\u043e\u0432\u0430\u043d\u043e!' },
+  hu: { title: 'Hiba bejelent\u00e9se', body: 'Hib\u00e1t tal\u00e1lt\u00e1l vagy van egy javaslat?\nK\u00fcldj e-mailt ide:', btn: 'E-mail m\u00e1sol\u00e1sa', copied: 'M\u00e1solva!' },
+  ro: { title: 'Raporteaz\u0103 o eroare', body: 'Ai g\u0103sit o eroare sau ai o sugestie?\nTrimite un e-mail la:', btn: 'Copiaz\u0103 e-mail', copied: 'Copiat!' },
+  el: { title: '\u0391\u03bd\u03b1\u03c6\u03bf\u03c1\u03ac \u03c3\u03c6\u03ac\u03bb\u03bc\u03b1\u03c4\u03bf\u03c2', body: '\u0392\u03c1\u03ae\u03ba\u03b1\u03c4\u03b5 \u03c3\u03c6\u03ac\u03bb\u03bc\u03b1 \u03ae \u03ad\u03c7\u03b5\u03c4\u03b5 \u03c0\u03c1\u03cc\u03c4\u03b1\u03c3\u03b7;\n\u03a3\u03c4\u03b5\u03af\u03bb\u03c4\u03b5 email \u03c3\u03c4\u03bf:', btn: '\u0391\u03bd\u03c4\u03b9\u03b3\u03c1\u03b1\u03c6\u03ae email', copied: '\u0391\u03bd\u03c4\u03b9\u03b3\u03c1\u03ac\u03c6\u03c4\u03b7\u03ba\u03b5!' },
+  hi: { title: '\u092c\u0917 \u0930\u093f\u092a\u094b\u0930\u094d\u091f \u0915\u0930\u0947\u0902', body: '\u0915\u094b\u0908 \u092c\u0917 \u092e\u093f\u0932\u093e \u092f\u093e \u0938\u0941\u091d\u093e\u0935 \u0939\u0948?\n\u0915\u0943\u092a\u092f\u093e \u0907\u0938 \u092a\u0930 \u0908\u092e\u0947\u0932 \u092d\u0947\u091c\u0947\u0902:', btn: '\u0908\u092e\u0947\u0932 \u0915\u0949\u092a\u0940 \u0915\u0930\u0947\u0902', copied: '\u0915\u0949\u092a\u0940 \u0939\u094b \u0917\u092f\u093e!' },
+  th: { title: '\u0e23\u0e32\u0e22\u0e07\u0e32\u0e19\u0e02\u0e49\u0e2d\u0e1c\u0e34\u0e14\u0e1e\u0e25\u0e32\u0e14', body: '\u0e1e\u0e1a\u0e02\u0e49\u0e2d\u0e1c\u0e34\u0e14\u0e1e\u0e25\u0e32\u0e14\u0e2b\u0e23\u0e37\u0e2d\u0e21\u0e35\u0e02\u0e49\u0e2d\u0e40\u0e2a\u0e19\u0e2d\u0e41\u0e19\u0e30?\n\u0e01\u0e23\u0e38\u0e13\u0e32\u0e2a\u0e48\u0e07\u0e2d\u0e35\u0e40\u0e21\u0e25\u0e44\u0e1b\u0e17\u0e35\u0e48:', btn: '\u0e04\u0e31\u0e14\u0e25\u0e2d\u0e01\u0e2d\u0e35\u0e40\u0e21\u0e25', copied: '\u0e04\u0e31\u0e14\u0e25\u0e2d\u0e01\u0e41\u0e25\u0e49\u0e27!' },
+  vi: { title: 'B\u00e1o l\u1ed7i', body: 'B\u1ea1n t\u00ecm th\u1ea5y l\u1ed7i ho\u1eb7c c\u00f3 g\u00f3p \u00fd?\nVui l\u00f2ng g\u1eedi email \u0111\u1ebfn:', btn: 'Sao ch\u00e9p email', copied: '\u0110\u00e3 sao ch\u00e9p!' },
+  id: { title: 'Laporkan bug', body: 'Menemukan bug atau punya saran?\nSilakan kirim email ke:', btn: 'Salin email', copied: 'Disalin!' },
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  Window-State (persistiert Größe, Position, Theme)
+// ═══════════════════════════════════════════════════════════════════
+
 const stateFile = path.join(app.getPath('userData'), 'window-state.json');
+let windowState = {};
+let lastSavedState = '';
 
 function loadWindowState() {
   try {
     if (fs.existsSync(stateFile)) windowState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-  } catch (e) { if (isDev) console.debug('Window-State laden fehlgeschlagen:', e.message); }
+  } catch {}
   if (windowState.customDesign !== undefined) customDesign = windowState.customDesign;
   if (windowState.isDarkMode !== undefined) isDarkMode = windowState.isDarkMode;
   return {
@@ -90,21 +164,32 @@ function loadWindowState() {
   };
 }
 
-let lastSavedState = '';
 const saveWindowState = debounce(() => {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   try {
     const bounds = mainWindow.getBounds();
-    const newState = { ...bounds, isMaximized: mainWindow.isMaximized(), customDesign, isDarkMode };
-    const json = JSON.stringify(newState);
+    const state = { ...bounds, isMaximized: mainWindow.isMaximized(), customDesign, isDarkMode };
+    const json = JSON.stringify(state);
     if (json === lastSavedState) return;
     lastSavedState = json;
-    windowState = newState;
-    fsp.writeFile(stateFile, json).catch(e => { if (isDev) console.debug('Window-State speichern fehlgeschlagen:', e.message); });
-  } catch (e) { if (isDev) console.debug('Window-State speichern fehlgeschlagen:', e.message); }
+    windowState = state;
+    fs.writeFile(stateFile, json, () => {});
+  } catch {}
 }, 500);
 
-// ── Domain-Prüfung ──
+function saveWindowStateSync() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    const bounds = mainWindow.getBounds();
+    const state = { ...bounds, isMaximized: mainWindow.isMaximized(), customDesign, isDarkMode };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+  } catch {}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Domain-Validierung
+// ═══════════════════════════════════════════════════════════════════
+
 const domainCache = new Map();
 
 function isAllowedDomain(url) {
@@ -112,15 +197,11 @@ function isAllowedDomain(url) {
   if (r !== undefined) return r;
   try { const h = new URL(url).hostname; r = h === 'claude.ai' || h.endsWith('.claude.ai'); }
   catch { r = false; }
-  if (domainCache.size >= DOMAIN_CACHE_MAX) {
-    // Ältesten Eintrag entfernen (Map behält Einfügereihenfolge)
-    domainCache.delete(domainCache.keys().next().value);
-  }
+  if (domainCache.size >= DOMAIN_CACHE_MAX) domainCache.delete(domainCache.keys().next().value);
   domainCache.set(url, r);
   return r;
 }
 
-// OAuth-Domains für Konnektoren (GitHub, Google Drive, etc.)
 function isOAuthDomain(url) {
   try {
     const h = new URL(url).hostname;
@@ -129,12 +210,14 @@ function isOAuthDomain(url) {
       || h === 'drive.google.com' || h === 'docs.google.com'
       || h === 'login.microsoftonline.com'
       || h === 'gitlab.com' || h === 'bitbucket.org'
-      || h.endsWith('.auth0.com')
-      || h.endsWith('.claude.ai');
+      || h.endsWith('.auth0.com') || h.endsWith('.claude.ai');
   } catch { return false; }
 }
 
-// ── Theme-Farben ──
+// ═══════════════════════════════════════════════════════════════════
+//  Theme & Design
+// ═══════════════════════════════════════════════════════════════════
+
 const THEME = {
   dark:  { bg: '#262624', bgHover: '#333330', bgActive: '#3a3a37', text: '#9a9a96', textActive: '#e8e8e4', border: '#333330' },
   light: { bg: '#f5f2ef', bgHover: '#ede9e4', bgActive: '#faf8f6', text: '#8a7e72', textActive: '#2a2420', border: '#e8e4de' }
@@ -145,353 +228,171 @@ const ACCENT = {
   original: { from: '#d4734c', to: '#d4734c' }
 };
 
-function currentTheme() { return isDarkMode ? THEME.dark : THEME.light; }
-function currentAccent() { return customDesign ? ACCENT.custom : ACCENT.original; }
-function currentIcon() { return path.join(__dirname, customDesign ? 'icon.png' : 'icon-original.png'); }
+function theme()  { return isDarkMode ? THEME.dark : THEME.light; }
+function accent() { return customDesign ? ACCENT.custom : ACCENT.original; }
+function icon()   { return path.join(__dirname, customDesign ? 'icon.png' : 'icon-original.png'); }
 
-// ── Custom Design Script für claude.ai ──
-const BRAND_SCRIPT = [
-  '(function() {',
-  '  if (window._cdActive) return;',
-  '  window._cdActive = true;',
-  '  var MID = "#E8524F";',
-  '',
-  '  function rgb(s) {',
-  '    if (!s || s.length < 10) return null;',
-  '    var i = s.indexOf("rgb"); if (i < 0) return null;',
-  '    var a = s.indexOf("(", i); if (a < 0) return null;',
-  '    var b = s.indexOf(")", a); if (b < 0) return null;',
-  '    var p = s.substring(a+1, b).split(",");',
-  '    return p.length >= 3 ? [parseInt(p[0]), parseInt(p[1]), parseInt(p[2])] : null;',
-  '  }',
-  '',
-  '  function isOrange(c) {',
-  '    return c[0]>=175 && c[0]<=235 && c[1]>=75 && c[1]<=135 && c[2]>=40 && c[2]<=105',
-  '      && c[0]-c[1]>=55 && c[0]-c[2]>=85;',
-  '  }',
-  '',
-  '  // --- CSS-Variable Override (cached) ---',
-  '  var _varsCached = false;',
-  '  function overrideVars() {',
-  '    if (_varsCached) return;',
-  '    var sheet = document.getElementById("cd-vars");',
-  '    if (!sheet) { sheet = document.createElement("style"); sheet.id = "cd-vars"; document.head.appendChild(sheet); }',
-  '    var rules = ":root{";',
-  '    try {',
-  '      for (var i = 0; i < document.styleSheets.length; i++) {',
-  '        try {',
-  '          var cr = document.styleSheets[i].cssRules;',
-  '          for (var j = 0; j < cr.length; j++) {',
-  '            if (cr[j].style) {',
-  '              for (var k = 0; k < cr[j].style.length; k++) {',
-  '                var prop = cr[j].style[k];',
-  '                if (prop.startsWith("--")) {',
-  '                  var val = cr[j].style.getPropertyValue(prop);',
-  '                  var c = rgb(val); if (c && isOrange(c)) rules += prop + ":" + MID + " !important;";',
-  '                }',
-  '              }',
-  '            }',
-  '          }',
-  '        } catch(e) {}',
-  '      }',
-  '    } catch(e) {}',
-  '    rules += "}";',
-  '    if (rules.length > 8) { sheet.textContent = rules; _varsCached = true; }',
-  '  }',
-  '',
-  '  // --- Recolor: SVGs, Buttons, Links + inline-styled Elemente ---',
-  '  function recolor() {',
-  '    overrideVars();',
-  '    document.querySelectorAll("svg, svg *").forEach(function(el) {',
-  '      try {',
-  '        var cs = getComputedStyle(el);',
-  '        var f = rgb(cs.fill); if (f && isOrange(f)) el.style.fill = MID;',
-  '        var s = rgb(cs.stroke); if (s && isOrange(s)) el.style.stroke = MID;',
-  '        var c = rgb(cs.color); if (c && isOrange(c)) el.style.color = MID;',
-  '      } catch(e) {}',
-  '    });',
-  '    document.querySelectorAll("button, a, span, [role=button], p, h1, h2, h3, div[style], span[style]").forEach(function(el) {',
-  '      try {',
-  '        var cs = getComputedStyle(el);',
-  '        var c = rgb(cs.color); if (c && isOrange(c)) el.style.color = MID;',
-  '        var bg = rgb(cs.backgroundColor); if (bg && isOrange(bg)) el.style.backgroundColor = MID;',
-  '        var bc = rgb(cs.borderColor); if (bc && isOrange(bc)) el.style.borderColor = MID;',
-  '      } catch(e) {}',
-  '    });',
-  '  }',
-  '',
-  '  // --- Gradient-Overlay (Dark + Light) ---',
-  '  var overlay = null;',
-  '  function updateOverlay() {',
-  '    var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;',
-  '    if (!overlay && document.body) {',
-  '      overlay = document.createElement("div");',
-  '      overlay.id = "cd-grad";',
-  '      document.body.appendChild(overlay);',
-  '    }',
-  '    if (overlay) {',
-  '      var o = dark ? "0.06" : "0.09";',
-  '      overlay.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;" +',
-  '        "background:radial-gradient(ellipse 70% 50% at 0% 0%,rgba(242,106,63," + o + "),transparent)," +',
-  '        "radial-gradient(ellipse 70% 50% at 100% 100%,rgba(232,59,110," + o + "),transparent)";',
-  '    }',
-  '  }',
-  '',
-  '  // --- Input-Box Glow ---',
-  '  function styleInputs() {',
-  '    var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;',
-  '    document.querySelectorAll("fieldset").forEach(function(fs) {',
-  '      if (!fs.querySelector("[contenteditable], textarea, [role=textbox], .ProseMirror")) return;',
-  '      fs.style.borderColor = dark ? "rgba(232,82,79,0.4)" : "rgba(232,82,79,0.35)";',
-  '      fs.style.boxShadow = dark',
-  '        ? "0 0 15px rgba(242,106,63,0.08), 0 0 30px rgba(232,59,110,0.06)"',
-  '        : "0 0 15px rgba(242,106,63,0.12), 0 0 30px rgba(232,59,110,0.09)";',
-  '    });',
-  '  }',
-  '',
-  '  // --- Theme-Wechsel erkennen ---',
-  '  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function() {',
-  '    _varsCached = false; updateOverlay(); styleInputs(); recolor();',
-  '  });',
-  '',
-  '  // --- Scan ---',
-  '  function scanAll() { recolor(); updateOverlay(); styleInputs(); }',
-  '',
-  '  var timer;',
-  '  var obs = new MutationObserver(function(muts) {',
-  '    clearTimeout(timer);',
-  '    timer = setTimeout(function() {',
-  '      for (var i = 0; i < muts.length; i++) {',
-  '        if (muts[i].addedNodes.length) { scanAll(); return; }',
-  '      }',
-  '    }, 150);',
-  '  });',
-  '',
-  '  function init() {',
-  '    scanAll();',
-  '    setTimeout(scanAll, 800);',
-  '    setTimeout(scanAll, 2000);',
-  '    setTimeout(scanAll, 4000);',
-  '    if (document.body) obs.observe(document.body, { childList: true, subtree: true });',
-  '  }',
-  '',
-  '  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);',
-  '  else init();',
-  '})()'
-].join('\n');
+// ═══════════════════════════════════════════════════════════════════
+//  Tab-Bar HTML
+// ═══════════════════════════════════════════════════════════════════
 
-// ── Pool wegwerfen (bei Theme-Wechsel) ──
-function drainPool() {
-  while (viewPool.length > 0) {
-    const v = viewPool.pop();
-    if (!v.webContents.isDestroyed()) v.webContents.close();
-  }
-}
+let _tabBarCache = '';
+let _tabBarKey = '';
 
-// ── Tab-Bar HTML ──
 function getTabBarHTML() {
-  const th = currentTheme();
-  const a = currentAccent();
-  return `<!DOCTYPE html><html><head>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
-  <style>
-  :root{--bg:${th.bg};--bgh:${th.bgHover};--bga:${th.bgActive};--t:${th.text};--ta:${th.textActive};--bd:${th.border};
-    --ac-from:${a.from};--ac-to:${a.to}}
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{background:var(--bg);font:500 12px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
-    color:var(--t);overflow:hidden;user-select:none;-webkit-app-region:drag;
-    height:${TAB_BAR_HEIGHT}px;display:flex;align-items:flex-end;border-bottom:1px solid var(--bd);contain:layout style}
-  #tabs{display:flex;align-items:flex-end;height:100%;flex:1;padding:0 8px;gap:2px;
-    -webkit-app-region:no-drag;overflow-x:auto}
-  #tabs::-webkit-scrollbar{height:0}
-  .tab{display:flex;align-items:center;height:34px;padding:0 14px;border-radius:10px 10px 0 0;
-    cursor:pointer;white-space:nowrap;max-width:220px;min-width:60px;gap:8px;
-    position:relative;color:var(--t);transition:background .15s,color .15s;contain:layout style}
-  .tab:hover{background:var(--bgh);color:var(--ta)}
-  .tab.active{background:var(--bga);color:var(--ta)}
-  .tab.active::after{content:'';position:absolute;bottom:0;left:10px;right:10px;height:2.5px;
-    background:linear-gradient(90deg,var(--ac-from),var(--ac-to));border-radius:2px 2px 0 0}
-  .tab-title{flex:1;overflow:hidden;text-overflow:ellipsis}
-  .tab-close{width:18px;height:18px;border-radius:6px;display:flex;align-items:center;justify-content:center;
-    font-size:15px;line-height:1;opacity:0;flex-shrink:0;transition:opacity .1s,background .1s}
-  .tab:hover .tab-close{opacity:.5}
-  .tab-close:hover{opacity:1!important;background:var(--bgh);color:var(--ac-to)}
-  .controls{display:flex;align-items:center;gap:2px;padding:0 6px 6px;-webkit-app-region:no-drag}
-  .ctrl-btn{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
-    cursor:pointer;color:var(--ta);font-size:16px;opacity:.85;transition:background .15s,color .15s,opacity .15s}
-  .ctrl-btn:hover{background:var(--bgh);color:var(--ac-to);opacity:1}
-  .ctrl-btn svg{width:16px;height:16px}
-  .design-pill{padding:2px 10px;height:22px;border-radius:11px;font-size:10px;font-weight:600;
-    letter-spacing:.4px;text-transform:uppercase;display:flex;align-items:center;cursor:pointer;
-    background:var(--bgh);color:var(--t);transition:all .15s;-webkit-app-region:no-drag;margin-right:2px}
-  .design-pill:hover{background:var(--bga);color:var(--ac-to)}
+  const key = `${isDarkMode}:${customDesign}`;
+  if (key === _tabBarKey && _tabBarCache) return _tabBarCache;
+  _tabBarKey = key;
+  const th = theme();
+  const a = accent();
+
+  _tabBarCache = `<!DOCTYPE html><html><head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+<style>
+:root{--bg:${th.bg};--bgh:${th.bgHover};--bga:${th.bgActive};--t:${th.text};--ta:${th.textActive};--bd:${th.border};
+  --ac-from:${a.from};--ac-to:${a.to}}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);font:500 12px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  color:var(--t);overflow:hidden;user-select:none;-webkit-app-region:drag;
+  height:${TAB_BAR_HEIGHT}px;display:flex;align-items:flex-end;border-bottom:1px solid var(--bd);contain:layout style}
+#tabs{display:flex;align-items:flex-end;height:100%;flex:1;padding:0 8px;gap:2px;
+  -webkit-app-region:no-drag;overflow-x:auto}
+#tabs::-webkit-scrollbar{height:0}
+.tab{display:flex;align-items:center;height:34px;padding:0 14px;border-radius:10px 10px 0 0;
+  cursor:pointer;white-space:nowrap;max-width:220px;min-width:60px;gap:8px;
+  position:relative;color:var(--t);transition:background .15s,color .15s;contain:layout style}
+.tab:hover{background:var(--bgh);color:var(--ta)}
+.tab.active{background:var(--bga);color:var(--ta)}
+.tab.active::after{content:'';position:absolute;bottom:0;left:10px;right:10px;height:2.5px;
+  background:linear-gradient(90deg,var(--ac-from),var(--ac-to));border-radius:2px 2px 0 0}
+.tab-title{flex:1;overflow:hidden;text-overflow:ellipsis}
+.tab-close{width:18px;height:18px;border-radius:6px;display:flex;align-items:center;justify-content:center;
+  font-size:15px;line-height:1;opacity:0;flex-shrink:0;transition:opacity .1s,background .1s}
+.tab:hover .tab-close{opacity:.5}
+.tab-close:hover{opacity:1!important;background:var(--bgh);color:var(--ac-to)}
+.controls{display:flex;align-items:center;gap:2px;padding:0 6px 6px;-webkit-app-region:no-drag}
+.ctrl-btn{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;color:var(--ta);font-size:16px;opacity:.85;transition:background .15s,color .15s,opacity .15s}
+.ctrl-btn:hover{background:var(--bgh);color:var(--ac-to);opacity:1}
+.ctrl-btn svg{width:16px;height:16px}
+.design-pill{padding:2px 10px;height:22px;border-radius:11px;font-size:10px;font-weight:600;
+  letter-spacing:.4px;text-transform:uppercase;display:flex;align-items:center;cursor:pointer;
+  background:var(--bgh);color:var(--t);transition:all .15s;-webkit-app-region:no-drag;margin-right:2px}
+.design-pill:hover{background:var(--bga);color:var(--ac-to)}
 </style></head><body>
-  <div id="tabs"></div>
-  <div class="controls">
-    <div class="design-pill" id="design-toggle" title="${t('Design wechseln', 'Toggle design')}">${customDesign ? 'Modern' : 'Classic'}</div>
-    <div class="ctrl-btn" id="new-tab" title="${t('Neuer Tab', 'New Tab')} (Ctrl+T)">
-      <svg viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg>
-    </div>
-    <div class="ctrl-btn" id="theme-toggle" title="${t('Theme wechseln', 'Toggle theme')}">
-      <svg id="theme-icon-dark" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
-      <svg id="theme-icon-light" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="5" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
-    </div>
+<div id="tabs"></div>
+<div class="controls">
+  <div class="design-pill" id="design-toggle" title="${t('Design wechseln', 'Toggle design')}">${customDesign ? 'Modern' : 'Classic'}</div>
+  <div class="ctrl-btn" id="bug-report" title="${(bugReportStrings[sysLang] || bugReportStrings.en).title}">
+    <svg viewBox="0 0 24 24" fill="none"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
   </div>
+  <div class="ctrl-btn" id="new-tab" title="${t('Neuer Tab', 'New Tab')} (Ctrl+T)">
+    <svg viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg>
+  </div>
+  <div class="ctrl-btn" id="theme-toggle" title="${t('Theme wechseln', 'Toggle theme')}">
+    <svg id="theme-icon-dark" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+    <svg id="theme-icon-light" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="5" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
+  </div>
+</div>
 <script>
-  const tabsEl=document.getElementById('tabs');
-  let tabEls=[];
-  document.getElementById('new-tab').addEventListener('click',()=>window.tabAPI.newTab());
-  document.getElementById('theme-toggle').addEventListener('click',()=>window.tabAPI.toggleTheme());
-  document.getElementById('design-toggle').addEventListener('click',()=>window.tabAPI.toggleDesign());
-  window.tabAPI.onDesignUpdate((custom)=>{
-    document.getElementById('design-toggle').textContent=custom?'Modern':'Classic';
-  });
+const tabsEl=document.getElementById('tabs');
+let tabEls=[];
+document.getElementById('new-tab').addEventListener('click',()=>window.tabAPI.newTab());
+document.getElementById('theme-toggle').addEventListener('click',()=>window.tabAPI.toggleTheme());
+document.getElementById('design-toggle').addEventListener('click',()=>window.tabAPI.toggleDesign());
+document.getElementById('bug-report').addEventListener('click',()=>window.tabAPI.bugReport());
 
-  window.tabAPI.onTabsUpdate((data)=>{
-    const c=data.tabs.length;
-    while(tabEls.length>c)tabsEl.removeChild(tabEls.pop());
-    for(let i=0;i<c;i++){
-      let el=tabEls[i];
-      if(!el){
-        el=document.createElement('div');el.className='tab';
-        el.innerHTML='<span class="tab-title"></span><span class="tab-close">&times;</span>';
-        el.addEventListener('click',(e)=>{
-          const idx=tabEls.indexOf(el);
-          if(e.target.classList.contains('tab-close'))window.tabAPI.closeTab(idx);
-          else window.tabAPI.switchTab(idx);
-        });
-        tabsEl.appendChild(el);tabEls.push(el);
-      }
-      const ts=el.firstChild,t=data.tabs[i].title;
-      if(ts.textContent!==t)ts.textContent=t;
-      const a=i===data.activeIndex;
-      if(el.classList.contains('active')!==a)el.classList.toggle('active',a);
-      el.lastChild.style.display=c>1?'':'none';
-    }
-  });
+window.tabAPI.onDesignUpdate(custom=>{
+  document.getElementById('design-toggle').textContent=custom?'Modern':'Classic';
+});
 
-  window.tabAPI.onThemeUpdate((dark)=>{
-    const r=document.documentElement.style;
-    if(dark){
-      r.setProperty('--bg','#262624');r.setProperty('--bgh','#333330');r.setProperty('--bga','#3a3a37');
-      r.setProperty('--t','#9a9a96');r.setProperty('--ta','#e8e8e4');r.setProperty('--bd','#333330');
-    }else{
-      r.setProperty('--bg','#f5f2ef');r.setProperty('--bgh','#ede9e4');r.setProperty('--bga','#faf8f6');
-      r.setProperty('--t','#8a7e72');r.setProperty('--ta','#2a2420');r.setProperty('--bd','#e8e4de');
+window.tabAPI.onTabsUpdate(data=>{
+  const c=data.tabs.length;
+  while(tabEls.length>c)tabsEl.removeChild(tabEls.pop());
+  for(let i=0;i<c;i++){
+    let el=tabEls[i];
+    if(!el){
+      el=document.createElement('div');el.className='tab';
+      el.innerHTML='<span class="tab-title"></span><span class="tab-close">&times;</span>';
+      el.addEventListener('click',e=>{
+        const idx=tabEls.indexOf(el);
+        if(e.target.classList.contains('tab-close'))window.tabAPI.closeTab(idx);
+        else window.tabAPI.switchTab(idx);
+      });
+      tabsEl.appendChild(el);tabEls.push(el);
     }
-    document.body.style.background=dark?'#262624':'#f5f2ef';
-    document.getElementById('theme-icon-dark').style.display=dark?'':'none';
-    document.getElementById('theme-icon-light').style.display=dark?'none':'';
-  });
+    const ts=el.firstChild,title=data.tabs[i].title;
+    if(ts.textContent!==title)ts.textContent=title;
+    const a=i===data.activeIndex;
+    if(el.classList.contains('active')!==a)el.classList.toggle('active',a);
+    el.lastChild.style.display=c>1?'':'none';
+  }
+});
+
+window.tabAPI.onThemeUpdate(dark=>{
+  const r=document.documentElement.style;
+  if(dark){
+    r.setProperty('--bg','#262624');r.setProperty('--bgh','#333330');r.setProperty('--bga','#3a3a37');
+    r.setProperty('--t','#9a9a96');r.setProperty('--ta','#e8e8e4');r.setProperty('--bd','#333330');
+  }else{
+    r.setProperty('--bg','#f5f2ef');r.setProperty('--bgh','#ede9e4');r.setProperty('--bga','#faf8f6');
+    r.setProperty('--t','#8a7e72');r.setProperty('--ta','#2a2420');r.setProperty('--bd','#e8e4de');
+  }
+  document.body.style.background=dark?'#262624':'#f5f2ef';
+  document.getElementById('theme-icon-dark').style.display=dark?'':'none';
+  document.getElementById('theme-icon-light').style.display=dark?'none':'';
+});
 </script></body></html>`;
+  return _tabBarCache;
 }
 
-// ── Tab-Bar Sync ──
+// ═══════════════════════════════════════════════════════════════════
+//  Tab-Bar Sync (IPC → Renderer)
+// ═══════════════════════════════════════════════════════════════════
+
 const sendTabsUpdate = throttle(() => {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send('tabs-update', {
-    tabs: tabs.map((t, i) => ({ title: t.title || `Tab ${i + 1}` })),
+    tabs: tabs.map((tab, i) => ({ title: tab.title || `Tab ${i + 1}` })),
     activeIndex: activeTabIndex
   });
-}, 32);
+}, 100);
 
 function sendThemeUpdate() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send('theme-update', isDarkMode);
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('theme-update', isDarkMode);
 }
 
 function sendDesignUpdate() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send('design-update', customDesign);
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('design-update', customDesign);
 }
 
-function toggleDesign() {
-  customDesign = !customDesign;
-  // Icon wechseln (Fenster + Taskleiste)
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setIcon(currentIcon());
-  try {
-    const iconDest = path.join(app.getPath('home'), 'Apps', 'claude-desktop-icon.png');
-    fs.copyFileSync(currentIcon(), iconDest);
-  } catch(e) {}
-  // Pool leeren + neu füllen
-  drainPool();
-  // Tab-Bar mit neuem Design neu laden
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(getTabBarHTML()));
-    mainWindow.webContents.once('did-finish-load', () => { sendTabsUpdate(); sendThemeUpdate(); sendDesignUpdate(); });
-  }
-  // Content-Tabs neu laden
-  tabs.forEach(tab => { if (!tab.view.webContents.isDestroyed()) tab.view.webContents.reload(); });
-  setImmediate(fillPool);
-  saveWindowState();
-  updateMenu(true);
+// ═══════════════════════════════════════════════════════════════════
+//  Script-Injection
+// ═══════════════════════════════════════════════════════════════════
+
+function injectScripts(wc) {
+  if (!alive(wc)) return;
+  if (customDesign) wc.executeJavaScript(BRAND_SCRIPT).catch(() => {});
 }
 
-// ── Menü (Cache) ──
-let lastMenuHash = '';
-
-function updateMenu(force = false) {
-  const hash = `${tabs.length}:${activeTabIndex}`;
-  if (!force && hash === lastMenuHash) return;
-  lastMenuHash = hash;
-
-  const tabItems = tabs.map((_, i) => ({
-    label: `Tab ${i + 1}${i === activeTabIndex ? ' \u25cf' : ''}`,
-    accelerator: i < 9 ? `CmdOrCtrl+${i + 1}` : undefined,
-    click: () => switchToTab(i)
-  }));
-
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
-    { label: 'Claude', submenu: [
-      { label: t('Neuer Tab', 'New Tab'), accelerator: 'CmdOrCtrl+T', click: () => createTab() },
-      { label: t('Tab schließen', 'Close Tab'), accelerator: 'CmdOrCtrl+W', click: () => closeTab(activeTabIndex) },
-      { type: 'separator' }, ...tabItems, { type: 'separator' },
-      { label: t('Einstellungen', 'Settings'), accelerator: 'CmdOrCtrl+,', click: () => {
-        if (tabs[activeTabIndex]) tabs[activeTabIndex].view.webContents.loadURL('https://claude.ai/settings');
-      }},
-      { type: 'separator' },
-      { label: `Design: ${customDesign ? 'Modern' : 'Classic'}`, click: toggleDesign },
-      { label: t('Nach Updates suchen…', 'Check for Updates…'), click: () => {
-        if (!isDev) autoUpdater.checkForUpdates().catch(() => {});
-      }},
-      { type: 'separator' },
-      { role: 'quit', label: t('Beenden', 'Quit') }
-    ]},
-    { label: t('Bearbeiten', 'Edit'), submenu: [
-      { role: 'undo', label: t('Rückgängig', 'Undo') }, { role: 'redo', label: t('Wiederholen', 'Redo') },
-      { type: 'separator' },
-      { role: 'cut', label: t('Ausschneiden', 'Cut') }, { role: 'copy', label: t('Kopieren', 'Copy') },
-      { role: 'paste', label: t('Einfügen', 'Paste') }, { role: 'selectAll', label: t('Alles auswählen', 'Select All') }
-    ]},
-    { label: t('Ansicht', 'View'), submenu: [
-      { label: t('Neu laden', 'Reload'), accelerator: 'CmdOrCtrl+R', click: () => tabs[activeTabIndex]?.view.webContents.reload() },
-      { label: t('Erzwungen neu laden', 'Force Reload'), accelerator: 'CmdOrCtrl+Shift+R', click: () => tabs[activeTabIndex]?.view.webContents.reloadIgnoringCache() },
-      { type: 'separator' },
-      { role: 'resetZoom', label: t('Zoom zurücksetzen', 'Reset Zoom') },
-      { role: 'zoomIn', label: t('Vergrößern', 'Zoom In') }, { role: 'zoomOut', label: t('Verkleinern', 'Zoom Out') },
-      { type: 'separator' }, { role: 'togglefullscreen', label: t('Vollbild', 'Fullscreen') },
-      ...(isDev ? [{ type: 'separator' }, { label: 'DevTools', accelerator: 'F12', click: () => tabs[activeTabIndex]?.view.webContents.toggleDevTools() }] : [])
-    ]},
-    { label: 'Tabs', submenu: [
-      { label: t('Neuer Tab', 'New Tab'), accelerator: 'CmdOrCtrl+T', click: () => createTab() },
-      { label: t('Tab schließen', 'Close Tab'), accelerator: 'CmdOrCtrl+W', click: () => closeTab(activeTabIndex) },
-      { type: 'separator' },
-      { label: t('Nächster Tab', 'Next Tab'), accelerator: 'CmdOrCtrl+Tab', click: () => switchToTab((activeTabIndex + 1) % tabs.length) },
-      { label: t('Vorheriger Tab', 'Previous Tab'), accelerator: 'CmdOrCtrl+Shift+Tab', click: () => switchToTab((activeTabIndex - 1 + tabs.length) % tabs.length) },
-      { type: 'separator' }, ...tabItems
-    ]},
-    { label: t('Fenster', 'Window'), submenu: [
-      { role: 'minimize', label: t('Minimieren', 'Minimize') }, { role: 'close', label: t('Schließen', 'Close') }
-    ]}
-  ]));
+function reinjectScripts(wc) {
+  if (!alive(wc)) return;
+  if (!customDesign) return;
+  // Nur re-injizieren wenn Brand-Script nicht mehr aktiv ist (z.B. nach Full-Navigation)
+  wc.executeJavaScript('!!window._cdBrand').then(active => {
+    if (!active) injectScripts(wc);
+  }).catch(() => {});
 }
 
-// ── View Setup ──
+// ═══════════════════════════════════════════════════════════════════
+//  View Setup (Security + Events)
+// ═══════════════════════════════════════════════════════════════════
+
 function setupView(view) {
   const wc = view.webContents;
 
+  // ── Window-Open: OAuth in-app, claude.ai erlaubt, Rest extern ──
   wc.setWindowOpenHandler(({ url }) => {
-    // OAuth-Popups (GitHub, Google Drive, etc.) in-app öffnen
     if (isOAuthDomain(url)) {
       return { action: 'allow', overrideBrowserWindowOptions: {
         width: 600, height: 750, title: t('Anmeldung', 'Sign In'),
@@ -506,66 +407,81 @@ function setupView(view) {
     return { action: 'deny' };
   });
 
-  // OAuth-Popups: Navigation innerhalb des Popup-Fensters erlauben
-  // (OAuth redirected zwischen Domains hin und her)
+  // ── OAuth-Popup Lifecycle ──
   wc.on('did-create-window', (childWindow) => {
-    let popupClosed = false;
-    const closePopup = () => {
-      if (popupClosed || childWindow.isDestroyed()) return;
-      popupClosed = true;
-      // Listener entfernen bevor wir schließen, verhindert Race-Conditions
-      childWindow.webContents.removeAllListeners('will-navigate');
-      childWindow.webContents.removeAllListeners('will-redirect');
-      childWindow.webContents.removeAllListeners('did-navigate');
+    let closed = false;
+    const cleanup = () => {
+      if (closed || childWindow.isDestroyed()) return;
+      closed = true;
+      childWindow.webContents.off('will-navigate', onNav);
+      childWindow.webContents.off('will-redirect', onRedirect);
+      childWindow.webContents.off('did-navigate', onDidNav);
       childWindow.close();
     };
-    childWindow.webContents.on('will-navigate', (event, navUrl) => {
-      if (popupClosed) return;
+    const onNav = (event, navUrl) => {
+      if (closed) return;
       if (!isOAuthDomain(navUrl) && !isAllowedDomain(navUrl)) {
-        try {
-          const p = new URL(navUrl).protocol;
-          if (p !== 'https:' && p !== 'http:') event.preventDefault();
-        } catch { event.preventDefault(); }
+        try { const p = new URL(navUrl).protocol; if (p !== 'https:' && p !== 'http:') event.preventDefault(); }
+        catch { event.preventDefault(); }
       }
-    });
-    childWindow.webContents.on('will-redirect', (_event, navUrl) => {
-      if (isAllowedDomain(navUrl)) closePopup();
-    });
-    childWindow.webContents.on('did-navigate', (_event, navUrl) => {
-      if (isAllowedDomain(navUrl)) closePopup();
-    });
+    };
+    const onRedirect = (_event, navUrl) => { if (isAllowedDomain(navUrl)) cleanup(); };
+    const onDidNav = (_event, navUrl) => { if (isAllowedDomain(navUrl)) cleanup(); };
+
+    childWindow.webContents.on('will-navigate', onNav);
+    childWindow.webContents.on('will-redirect', onRedirect);
+    childWindow.webContents.on('did-navigate', onDidNav);
   });
 
+  // ── Navigation Guards ──
   wc.on('will-navigate', (event, navUrl) => {
     if (!isAllowedDomain(navUrl) && !isOAuthDomain(navUrl)) event.preventDefault();
   });
 
+  wc.on('will-frame-navigate', (event) => {
+    const navUrl = event.url;
+    if (!isAllowedDomain(navUrl) && !isOAuthDomain(navUrl)) {
+      try { const p = new URL(navUrl).protocol; if (p !== 'https:' && p !== 'http:') event.preventDefault(); }
+      catch { event.preventDefault(); }
+    }
+  });
+
+  // ── Tab-Titel ──
   wc.on('page-title-updated', (_, title) => {
-    const idx = tabs.findIndex(t => t.view === view);
+    const idx = tabs.findIndex(tab => tab.view === view);
     if (idx >= 0) {
       const clean = title.replace(/\s*[-\u2013]\s*Claude.*$/, '') || t('Neuer Chat', 'New Chat');
       if (tabs[idx].title !== clean) { tabs[idx].title = clean; sendTabsUpdate(); }
     }
   });
 
+  // ── Script-Injection bei Page-Load ──
   wc.on('did-finish-load', () => {
     updateTitle();
-    if (customDesign) wc.executeJavaScript(BRAND_SCRIPT).catch(() => {});
+    injectScripts(wc);
   });
 
+  // ── SPA-Navigation (Chat-Wechsel): Scripts re-injizieren ──
+  wc.on('did-navigate-in-page', () => reinjectScripts(wc));
+
+  // ── Crash-Recovery ──
   wc.on('render-process-gone', (_, details) => {
-    if (details.reason !== 'clean-exit' && !wc.isDestroyed()) {
-      const count = (crashCounts.get(wc) || 0) + 1;
-      crashCounts.set(wc, count);
-      if (count > MAX_CRASH_RELOADS) {
-        console.error(`Tab crashed ${count}x (${details.reason}), giving up.`);
-        return;
-      }
-      console.error(`Tab crashed (${details.reason}), reload ${count}/${MAX_CRASH_RELOADS}...`);
-      setTimeout(() => { if (!wc.isDestroyed()) wc.reload(); }, RELOAD_DELAY_MS);
+    if (details.reason === 'clean-exit' || wc.isDestroyed()) return;
+    const tab = tabs.find(t => t.view === view);
+    if (!tab) return;
+    tab.crashCount = (tab.crashCount || 0) + 1;
+    if (tab.crashCount > MAX_CRASH_RELOADS) {
+      console.error(`Tab crashed ${tab.crashCount}x (${details.reason}), giving up.`);
+      return;
     }
+    console.error(`Tab crashed (${details.reason}), reload ${tab.crashCount}/${MAX_CRASH_RELOADS}...`);
+    setTimeout(() => { if (alive(wc)) wc.reload(); }, 300);
   });
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  View-Erstellung + Pool
+// ═══════════════════════════════════════════════════════════════════
 
 function createContentView() {
   const view = new WebContentsView({
@@ -574,47 +490,49 @@ function createContentView() {
       partition: 'persist:claude',
       backgroundThrottling: true,
       spellcheck: false,
-      v8CacheOptions: 'bypassHeatCheck',
     }
   });
-  view.setBackgroundColor(currentTheme().bg);
+  view.setBackgroundColor(theme().bg);
   view.setVisible(false);
   view.webContents.setUserAgent(chromeUA);
   return view;
 }
 
-// ── Tab-Pool: Hält fertig geladene Views bereit ──
-let isPoolRefilling = false;
+function drainPool() {
+  while (viewPool.length > 0) {
+    const v = viewPool.pop();
+    if (alive(v)) v.webContents.close();
+  }
+}
 
 function fillPool() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  isPoolRefilling = true;
-  while (viewPool.length < PRELOAD_POOL_SIZE) {
+  while (viewPool.length < POOL_SIZE) {
     const view = createContentView();
     setupView(view);
     view.webContents.loadURL('https://claude.ai');
     viewPool.push(view);
   }
-  isPoolRefilling = false;
 }
 
 function getPooledView() {
   if (viewPool.length > 0) {
     const view = viewPool.shift();
-    if (!isPoolRefilling) setImmediate(fillPool);
+    setTimeout(fillPool, 3000);
     return view;
   }
   return null;
 }
 
-// ── Tab-Operationen ──
-function createTab(url = 'https://claude.ai') {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
 
-  let view;
-  if (url === 'https://claude.ai') {
-    view = getPooledView();
-  }
+// ═══════════════════════════════════════════════════════════════════
+//  Tab-Operationen
+// ═══════════════════════════════════════════════════════════════════
+
+function createTab(url = 'https://claude.ai') {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+
+  let view = (url === 'https://claude.ai') ? getPooledView() : null;
   if (!view) {
     view = createContentView();
     setupView(view);
@@ -622,31 +540,46 @@ function createTab(url = 'https://claude.ai') {
   }
 
   mainWindow.contentView.addChildView(view);
-  tabs.push({ view, title: t('Neuer Chat', 'New Chat'), url });
+  tabs.push({ view, title: t('Neuer Chat', 'New Chat'), url, crashCount: 0 });
   switchToTab(tabs.length - 1);
   updateMenu();
   return tabs[tabs.length - 1];
 }
 
+let lastViewBounds = '';
+const resizeActiveView = throttle(() => {
+  if (!mainWindow || mainWindow.isDestroyed() || !tabs[activeTabIndex]) return;
+  const b = mainWindow.getContentBounds();
+  const key = `${b.width}:${b.height}`;
+  if (key === lastViewBounds) return;
+  lastViewBounds = key;
+  tabs[activeTabIndex].view.setBounds({ x: 0, y: TAB_BAR_HEIGHT, width: b.width, height: b.height - TAB_BAR_HEIGHT });
+}, 16);
+
 function switchToTab(index) {
   if (index < 0 || index >= tabs.length || !mainWindow || mainWindow.isDestroyed()) return;
-  const targetView = tabs[index].view;
-  if (targetView.webContents.isDestroyed()) return;
-  if (index === activeTabIndex && targetView.getVisible()) {
+  const target = tabs[index];
+  if (!alive(target.view)) return;
+
+  if (index === activeTabIndex && target.view.getVisible()) {
     sendTabsUpdate();
     return;
   }
-  // Inaktiven Tab verstecken + drosseln
-  const prev = tabs[activeTabIndex]?.view;
-  if (prev && !prev.webContents.isDestroyed()) {
-    prev.setVisible(false);
-    prev.webContents.setBackgroundThrottling(true);
+
+  // Alten Tab verstecken
+  const prev = tabs[activeTabIndex];
+  if (prev && alive(prev.view)) {
+    prev.view.setVisible(false);
+    prev.view.webContents.setBackgroundThrottling(true);
   }
 
   activeTabIndex = index;
-  targetView.setVisible(true);
-  targetView.webContents.setBackgroundThrottling(false);
-  lastViewBounds = ''; // Force resize nach Tab-Wechsel
+
+  target.view.setVisible(true);
+  target.view.webContents.setBackgroundThrottling(false);
+  if (target.needsReload) { target.needsReload = false; target.view.webContents.reload(); }
+
+  lastViewBounds = '';
   resizeActiveView();
   updateTitle();
   updateMenu();
@@ -669,32 +602,186 @@ function closeTab(index) {
     if (activeTabIndex >= tabs.length) activeTabIndex = tabs.length - 1;
   }
 
-  setImmediate(() => { if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close(); });
+  setImmediate(() => {
+    if (alive(tab.view)) {
+      tab.view.webContents.removeAllListeners();
+      tab.view.webContents.close();
+    }
+  });
   updateMenu();
   sendTabsUpdate();
 }
-
-let lastViewBounds = '';
-const resizeActiveView = throttle(() => {
-  if (!mainWindow || mainWindow.isDestroyed() || !tabs[activeTabIndex]) return;
-  const b = mainWindow.getContentBounds();
-  const key = `${b.width}:${b.height}`;
-  if (key === lastViewBounds) return;
-  lastViewBounds = key;
-  tabs[activeTabIndex].view.setBounds({ x: 0, y: TAB_BAR_HEIGHT, width: b.width, height: b.height - TAB_BAR_HEIGHT });
-}, 16);
 
 function updateTitle() {
   if (!mainWindow || mainWindow.isDestroyed() || !tabs[activeTabIndex]) return;
   const wc = tabs[activeTabIndex].view.webContents;
   if (wc.isDestroyed()) return;
-  const loading = wc.isLoading();
   const info = tabs.length > 1 ? ` (${activeTabIndex + 1}/${tabs.length})` : '';
-  const title2 = !isOnline ? 'Claude \u2013 Offline' : loading ? 'Claude \u2013 ' + t('Laden\u2026', 'Loading\u2026') + info : 'Claude' + info;
-  if (mainWindow.getTitle() !== title2) mainWindow.setTitle(title2);
+  const title = !isOnline ? 'Claude \u2013 Offline'
+    : wc.isLoading() ? 'Claude \u2013 ' + t('Laden\u2026', 'Loading\u2026') + info
+    : 'Claude' + info;
+  if (mainWindow.getTitle() !== title) mainWindow.setTitle(title);
 }
 
-// ── Offline ──
+// ═══════════════════════════════════════════════════════════════════
+//  Design-Toggle
+// ═══════════════════════════════════════════════════════════════════
+
+function toggleDesign() {
+  customDesign = !customDesign;
+
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setIcon(icon());
+  try { fs.copyFileSync(icon(), path.join(app.getPath('home'), 'Apps', 'claude-desktop-icon.png')); } catch {}
+
+  drainPool();
+
+  // Tab-Bar mit neuem Design neu laden
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(getTabBarHTML()));
+    mainWindow.webContents.once('did-finish-load', () => {
+      sendTabsUpdate();
+      sendThemeUpdate();
+      sendDesignUpdate();
+    });
+  }
+
+  // Aktiven Tab neu laden, Rest lazy
+  if (tabs[activeTabIndex] && alive(tabs[activeTabIndex].view)) {
+    tabs[activeTabIndex].view.webContents.reload();
+  }
+  tabs.forEach((tab, i) => { if (i !== activeTabIndex) tab.needsReload = true; });
+
+  setTimeout(fillPool, 3000);
+  saveWindowState();
+  updateMenu(true);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Bug-Report-Dialog
+// ═══════════════════════════════════════════════════════════════════
+
+const BUG_EMAIL = 'claudeai.desktop.linux@gmail.com';
+
+function showBugReportDialog() {
+  const s = bugReportStrings[sysLang] || bugReportStrings.en;
+  const dark = isDarkMode;
+  const bg = dark ? '#1a1a18' : '#faf8f6';
+  const fg = dark ? '#e8e0d8' : '#2a2420';
+  const sub = dark ? '#9a9a96' : '#8a7e72';
+  const btnBg = '#E8524F';
+
+  const win = new BrowserWindow({
+    width: 420, height: 260, resizable: false,
+    parent: mainWindow, modal: true,
+    title: s.title, icon: icon(),
+    backgroundColor: bg,
+    webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true }
+  });
+  win.setMenuBarVisibility(false);
+
+  const html = `<!DOCTYPE html><html><head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:${bg};color:${fg};font-family:system-ui,sans-serif;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;height:100vh;padding:24px;text-align:center}
+h2{font-size:18px;font-weight:600;margin-bottom:12px}
+p{color:${sub};font-size:13px;line-height:1.6;white-space:pre-line;margin-bottom:16px}
+.email{font-size:15px;font-weight:600;color:${fg};margin-bottom:20px;word-break:break-all}
+button{background:${btnBg};color:#fff;border:none;padding:10px 28px;border-radius:10px;
+  font-size:14px;cursor:pointer;font-weight:500;transition:background .15s}
+button:hover{background:#F0635C}
+</style></head><body>
+<h2>${s.title}</h2>
+<p>${s.body}</p>
+<div class="email">${BUG_EMAIL}</div>
+<button onclick="navigator.clipboard.writeText('${BUG_EMAIL}').then(()=>{this.textContent='${s.copied}';setTimeout(()=>this.textContent='${s.btn}',1500)})">${s.btn}</button>
+</body></html>`;
+
+  win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Menü
+// ═══════════════════════════════════════════════════════════════════
+
+let lastMenuHash = '';
+let menuPending = false;
+
+function updateMenu(force = false) {
+  const hash = `${tabs.length}:${activeTabIndex}`;
+  if (!force && hash === lastMenuHash) return;
+  lastMenuHash = hash;
+  if (menuPending) return;
+  menuPending = true;
+
+  setImmediate(() => {
+    menuPending = false;
+
+    const tabItems = tabs.map((_, i) => ({
+      label: `Tab ${i + 1}${i === activeTabIndex ? ' \u25cf' : ''}`,
+      accelerator: i < 9 ? `CmdOrCtrl+${i + 1}` : undefined,
+      click: () => switchToTab(i)
+    }));
+
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      { label: 'Claude', submenu: [
+        { label: t('Neuer Tab', 'New Tab'), accelerator: 'CmdOrCtrl+T', click: () => createTab() },
+        { label: t('Tab schlie\u00dfen', 'Close Tab'), accelerator: 'CmdOrCtrl+W', click: () => closeTab(activeTabIndex) },
+        { type: 'separator' }, ...tabItems, { type: 'separator' },
+        { label: t('Einstellungen', 'Settings'), accelerator: 'CmdOrCtrl+,', click: () => {
+          if (tabs[activeTabIndex] && alive(tabs[activeTabIndex].view))
+            tabs[activeTabIndex].view.webContents.loadURL('https://claude.ai/settings');
+        }},
+        { type: 'separator' },
+        { label: `Design: ${customDesign ? 'Modern' : 'Classic'}`, click: toggleDesign },
+        { label: t('Nach Updates suchen\u2026', 'Check for Updates\u2026'), click: () => {
+          if (!isDev) autoUpdater.checkForUpdates().catch(() => {});
+        }},
+        { label: (bugReportStrings[sysLang] || bugReportStrings.en).title, click: showBugReportDialog },
+        { type: 'separator' },
+        { role: 'quit', label: t('Beenden', 'Quit') }
+      ]},
+      { label: t('Bearbeiten', 'Edit'), submenu: [
+        { role: 'undo', label: t('R\u00fcckg\u00e4ngig', 'Undo') },
+        { role: 'redo', label: t('Wiederholen', 'Redo') },
+        { type: 'separator' },
+        { role: 'cut', label: t('Ausschneiden', 'Cut') },
+        { role: 'copy', label: t('Kopieren', 'Copy') },
+        { role: 'paste', label: t('Einf\u00fcgen', 'Paste') },
+        { role: 'selectAll', label: t('Alles ausw\u00e4hlen', 'Select All') }
+      ]},
+      { label: t('Ansicht', 'View'), submenu: [
+        { label: t('Neu laden', 'Reload'), accelerator: 'CmdOrCtrl+R', click: () => { if (tabs[activeTabIndex] && alive(tabs[activeTabIndex].view)) tabs[activeTabIndex].view.webContents.reload(); } },
+        { label: t('Erzwungen neu laden', 'Force Reload'), accelerator: 'CmdOrCtrl+Shift+R', click: () => { if (tabs[activeTabIndex] && alive(tabs[activeTabIndex].view)) tabs[activeTabIndex].view.webContents.reloadIgnoringCache(); } },
+        { type: 'separator' },
+        { role: 'resetZoom', label: t('Zoom zur\u00fccksetzen', 'Reset Zoom') },
+        { role: 'zoomIn', label: t('Vergr\u00f6\u00dfern', 'Zoom In') },
+        { role: 'zoomOut', label: t('Verkleinern', 'Zoom Out') },
+        { type: 'separator' },
+        { role: 'togglefullscreen', label: t('Vollbild', 'Fullscreen') },
+        ...(isDev ? [{ type: 'separator' }, { label: 'DevTools', accelerator: 'F12', click: () => { if (tabs[activeTabIndex] && alive(tabs[activeTabIndex].view)) tabs[activeTabIndex].view.webContents.toggleDevTools(); } }] : [])
+      ]},
+      { label: 'Tabs', submenu: [
+        { label: t('Neuer Tab', 'New Tab'), accelerator: 'CmdOrCtrl+T', click: () => createTab() },
+        { label: t('Tab schlie\u00dfen', 'Close Tab'), accelerator: 'CmdOrCtrl+W', click: () => closeTab(activeTabIndex) },
+        { type: 'separator' },
+        { label: t('N\u00e4chster Tab', 'Next Tab'), accelerator: 'CmdOrCtrl+Tab', click: () => switchToTab((activeTabIndex + 1) % tabs.length) },
+        { label: t('Vorheriger Tab', 'Previous Tab'), accelerator: 'CmdOrCtrl+Shift+Tab', click: () => switchToTab((activeTabIndex - 1 + tabs.length) % tabs.length) },
+        { type: 'separator' }, ...tabItems
+      ]},
+      { label: t('Fenster', 'Window'), submenu: [
+        { role: 'minimize', label: t('Minimieren', 'Minimize') },
+        { role: 'close', label: t('Schlie\u00dfen', 'Close') }
+      ]}
+    ]));
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Offline-Handling
+// ═══════════════════════════════════════════════════════════════════
+
 function handleOnlineChange(online) {
   if (online === isOnline) return;
   isOnline = online;
@@ -703,15 +790,17 @@ function handleOnlineChange(online) {
     showOfflinePage();
     new Notification({ title: 'Claude', body: t('Keine Internetverbindung.', 'No internet connection.') }).show();
   } else {
-    if (tabs[activeTabIndex] && !tabs[activeTabIndex].view.webContents.isDestroyed())
+    if (tabs[activeTabIndex] && alive(tabs[activeTabIndex].view))
       tabs[activeTabIndex].view.webContents.reload();
     new Notification({ title: 'Claude', body: t('Verbindung wiederhergestellt!', 'Connection restored!') }).show();
   }
 }
 
 function showOfflinePage() {
-  if (!tabs[activeTabIndex]) return;
-  tabs[activeTabIndex].view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(`<!DOCTYPE html><html><head>
+  const tab = tabs[activeTabIndex];
+  if (!tab || !alive(tab.view)) return;
+  tab.view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(
+    `<!DOCTYPE html><html><head>
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
     <style>
     body{background:#171310;color:#e8e0d8;font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0}
@@ -720,12 +809,19 @@ function showOfflinePage() {
     button{margin-top:20px;background:#E8524F;color:#fff;border:none;padding:10px 28px;border-radius:10px;font-size:14px;cursor:pointer;font-weight:500}
     button:hover{background:#F0635C}
     .pulse{animation:p 2s ease-in-out infinite}@keyframes p{0%,100%{opacity:.3}50%{opacity:1}}
-  </style></head><body><h1>${t('Keine Verbindung', 'No Connection')}</h1><p>${t('Prüfe deine Netzwerkverbindung.', 'Check your network connection.')}</p>
-    <p class="pulse" style="font-size:12px">${t('Automatische Wiederverbindung…', 'Reconnecting automatically…')}</p>
-    <button onclick="location.href='https://claude.ai'">${t('Erneut versuchen', 'Try Again')}</button></body></html>`));
+    </style></head><body>
+    <h1>${t('Keine Verbindung', 'No Connection')}</h1>
+    <p>${t('Pr\u00fcfe deine Netzwerkverbindung.', 'Check your network connection.')}</p>
+    <p class="pulse" style="font-size:12px">${t('Automatische Wiederverbindung\u2026', 'Reconnecting automatically\u2026')}</p>
+    <button onclick="location.href='https://claude.ai'">${t('Erneut versuchen', 'Try Again')}</button>
+    </body></html>`
+  ));
 }
 
-// ── Downloads ──
+// ═══════════════════════════════════════════════════════════════════
+//  Download-Manager
+// ═══════════════════════════════════════════════════════════════════
+
 function setupDownloadManager() {
   session.fromPartition('persist:claude').on('will-download', (_, item) => {
     const fileName = item.getFilename();
@@ -735,6 +831,7 @@ function setupDownloadManager() {
     });
     if (!savePath) { item.cancel(); return; }
     item.setSavePath(savePath);
+
     item.on('updated', (_, state) => {
       if (state === 'progressing' && !item.isPaused() && mainWindow && !mainWindow.isDestroyed()) {
         const total = item.getTotalBytes();
@@ -745,6 +842,7 @@ function setupDownloadManager() {
         }
       }
     });
+
     item.once('done', (_, state) => {
       if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.setProgressBar(-1); updateTitle(); }
       if (state === 'completed') new Notification({ title: t('Download fertig', 'Download complete'), body: fileName }).show();
@@ -753,67 +851,79 @@ function setupDownloadManager() {
   });
 }
 
-// ── Auto-Updater ──
+// ═══════════════════════════════════════════════════════════════════
+//  Auto-Updater
+// ═══════════════════════════════════════════════════════════════════
+
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
 
 function setupAutoUpdater() {
   if (isDev) return;
-  let updateFailures = 0;
+  let failures = 0;
+
   autoUpdater.on('update-available', (info) => {
-    updateFailures = 0;
-    new Notification({ title: t('Update verfügbar', 'Update available'), body: `v${info.version} ${t('wird geladen…', 'downloading…')}` }).show();
+    failures = 0;
+    new Notification({ title: t('Update verf\u00fcgbar', 'Update available'), body: `v${info.version} ${t('wird geladen\u2026', 'downloading\u2026')}` }).show();
   });
+
   autoUpdater.on('download-progress', (p) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setTitle(`Claude \u2013 Update ${Math.round(p.percent)}%`);
       mainWindow.setProgressBar(p.percent / 100);
     }
   });
+
   autoUpdater.on('update-downloaded', (info) => {
     if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.setTitle('Claude'); mainWindow.setProgressBar(-1); }
     if (dialog.showMessageBoxSync(mainWindow, {
       type: 'info', title: t('Update bereit', 'Update ready'),
       message: `v${info.version} ${t('heruntergeladen. Jetzt neu starten?', 'downloaded. Restart now?')}`,
-      buttons: [t('Neu starten', 'Restart'), t('Später', 'Later')], defaultId: 0
+      buttons: [t('Neu starten', 'Restart'), t('Sp\u00e4ter', 'Later')], defaultId: 0
     }) === 0) autoUpdater.quitAndInstall();
   });
+
   autoUpdater.on('error', (err) => {
-    updateFailures++;
-    console.error(`Update-Fehler (${updateFailures}x):`, err.message);
+    failures++;
+    if (isDev) console.error(`Update-Fehler (${failures}x):`, err.message);
   });
+
   autoUpdater.checkForUpdates().catch(() => {});
   setInterval(() => {
-    // Echtes exponentielles Backoff: bei Fehlern Intervalle überspringen (2^failures - 1)
-    if (updateFailures > 0) {
-      const skip = (1 << Math.min(updateFailures, 5)) - 1;
+    if (failures > 0) {
+      const skip = (1 << Math.min(failures, 5)) - 1;
       if (Math.random() < skip / (skip + 1)) return;
     }
     autoUpdater.checkForUpdates().catch(() => {});
-  }, UPDATE_CHECK_INTERVAL_MS);
+  }, UPDATE_CHECK_MS);
 }
 
-// ── Session-Optimierung ──
-function optimizeSession() {
+// ═══════════════════════════════════════════════════════════════════
+//  Session Security
+// ═══════════════════════════════════════════════════════════════════
+
+function setupSession() {
   const ses = session.fromPartition('persist:claude');
+  const allowed = new Set(['clipboard-read', 'clipboard-sanitized-write', 'notifications', 'fullscreen']);
 
-  ses.setPermissionRequestHandler((wc, permission, callback) => {
-    const allowed = ['clipboard-read', 'clipboard-sanitized-write', 'notifications', 'fullscreen'];
-    callback(allowed.includes(permission));
-  });
+  ses.setPermissionRequestHandler((_, perm, cb) => cb(allowed.has(perm)));
+  ses.setPermissionCheckHandler((_, perm) => allowed.has(perm));
 
-  // DNT-Header für claude.ai Requests
   ses.webRequest.onBeforeSendHeaders({ urls: ['*://*.claude.ai/*'] }, (details, cb) => {
     details.requestHeaders['DNT'] = '1';
     cb({ requestHeaders: details.requestHeaders });
   });
 
-  // Preconnect bei Session-Start
-  ses.preconnect({ url: 'https://claude.ai', numSockets: 4 });
+  // Preconnect (mehr Sockets für schnellere erste Requests)
+  ses.preconnect({ url: 'https://claude.ai', numSockets: 6 });
   ses.preconnect({ url: 'https://cdn.claude.ai', numSockets: 2 });
+  ses.preconnect({ url: 'https://api.claude.ai', numSockets: 2 });
 }
 
-// ── IPC ──
+// ═══════════════════════════════════════════════════════════════════
+//  IPC-Handler
+// ═══════════════════════════════════════════════════════════════════
+
 ipcMain.on('tab-new', () => createTab());
 ipcMain.on('tab-switch', (_, i) => {
   if (typeof i === 'number' && Number.isInteger(i) && i >= 0 && i < tabs.length) switchToTab(i);
@@ -822,49 +932,50 @@ ipcMain.on('tab-close', (_, i) => {
   if (typeof i === 'number' && Number.isInteger(i) && i >= 0 && i < tabs.length) closeTab(i);
 });
 ipcMain.on('design-toggle', toggleDesign);
+ipcMain.on('bug-report', showBugReportDialog);
 ipcMain.on('theme-toggle', () => {
   isDarkMode = !isDarkMode;
-  // 1) Pool-Views zerstören – die würden sonst im gleichen Renderer mit re-rendern
   drainPool();
-  // 2) Aktiven Tab Background sofort setzen
-  const bg = currentTheme().bg;
+
+  const bg = theme().bg;
   const active = tabs[activeTabIndex]?.view;
-  if (active && !active.webContents.isDestroyed()) active.setBackgroundColor(bg);
-  // 3) nativeTheme umschalten (claude.ai reagiert via prefers-color-scheme)
+  if (active && alive(active)) active.setBackgroundColor(bg);
+
   nativeTheme.themeSource = isDarkMode ? 'dark' : 'light';
-  // 4) Tab-Bar updaten
   sendThemeUpdate();
-  // 5) Inaktive Tabs Background setzen (niedrige Priorität)
+
   for (const tab of tabs) {
-    if (tab.view !== active && !tab.view.webContents.isDestroyed()) tab.view.setBackgroundColor(bg);
+    if (tab.view !== active && alive(tab.view)) tab.view.setBackgroundColor(bg);
   }
-  // 6) Pool neu füllen sobald Event-Loop frei ist (im neuen Theme)
-  setImmediate(fillPool);
+
+  setTimeout(fillPool, 3000);
 });
 
-// ── Fenster ──
+// ═══════════════════════════════════════════════════════════════════
+//  Fenster erstellen
+// ═══════════════════════════════════════════════════════════════════
+
 function createWindow() {
   const state = loadWindowState();
   nativeTheme.themeSource = isDarkMode ? 'dark' : 'light';
+
   mainWindow = new BrowserWindow({
     width: state.width, height: state.height, x: state.x, y: state.y,
     minWidth: 480, minHeight: 600, title: 'Claude',
-    icon: currentIcon(),
-    backgroundColor: currentTheme().bg,
+    icon: icon(),
+    backgroundColor: theme().bg,
     show: false,
     webPreferences: {
       nodeIntegration: false, contextIsolation: true, sandbox: true,
       preload: path.join(__dirname, 'preload-tabbar.js'),
       backgroundThrottling: false,
       spellcheck: false,
-      v8CacheOptions: 'bypassHeatCheck',
     }
   });
 
   if (state.isMaximized) mainWindow.maximize();
 
   mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(getTabBarHTML()));
-
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
   mainWindow.on('resize', () => { saveWindowState(); resizeActiveView(); });
@@ -872,53 +983,47 @@ function createWindow() {
   mainWindow.on('maximize', saveWindowState);
   mainWindow.on('unmaximize', saveWindowState);
 
-  mainWindow.on('blur', () => {
-    const v = tabs[activeTabIndex]?.view;
-    if (v && !v.webContents.isDestroyed()) {
-      v.webContents.executeJavaScript('document.activeElement?.blur()').catch(() => {});
-    }
-  });
-
   mainWindow.on('closed', () => {
     mainWindow = null;
-    tabs.forEach(t => { if (!t.view.webContents.isDestroyed()) t.view.webContents.close(); });
+    tabs.forEach(t => {
+      if (alive(t.view)) t.view.webContents.close();
+    });
     tabs = [];
-    viewPool.forEach(v => { if (!v.webContents.isDestroyed()) v.webContents.close(); });
-    viewPool.length = 0;
+    drainPool();
   });
 
+  // Erster Tab + Pool verzögert füllen
   mainWindow.webContents.once('did-finish-load', () => {
     const tab = createTab('https://claude.ai');
-    // Pool erst füllen wenn der erste Tab fertig geladen hat (spart Bandbreite/CPU beim Start)
     if (tab) {
-      tab.view.webContents.once('did-finish-load', () => setImmediate(fillPool));
+      tab.view.webContents.once('did-finish-load', () => setTimeout(fillPool, 2000));
     }
   });
 }
 
-// ── Start ──
+// ═══════════════════════════════════════════════════════════════════
+//  App Lifecycle
+// ═══════════════════════════════════════════════════════════════════
+
 app.on('second-instance', () => {
   if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
 });
 
+// Webview-Tags blockieren (Security)
+app.on('web-contents-created', (_, wc) => {
+  wc.on('will-attach-webview', (event) => event.preventDefault());
+});
+
 app.whenReady().then(() => {
-  optimizeSession();
+  setupSession();
   createWindow();
   updateMenu(true);
   setupDownloadManager();
   setupAutoUpdater();
   handleOnlineChange(net.isOnline());
-  setInterval(() => handleOnlineChange(net.isOnline()), ONLINE_CHECK_INTERVAL_MS);
+  setInterval(() => handleOnlineChange(net.isOnline()), ONLINE_CHECK_MS);
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', () => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    try {
-      const bounds = mainWindow.getBounds();
-      windowState = { ...bounds, isMaximized: mainWindow.isMaximized(), customDesign, isDarkMode };
-      fs.writeFileSync(stateFile, JSON.stringify(windowState));
-    } catch (e) { if (isDev) console.debug('Window-State bei Quit fehlgeschlagen:', e.message); }
-  }
-});
+app.on('before-quit', saveWindowStateSync);
