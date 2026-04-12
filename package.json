@@ -1,6 +1,6 @@
 {
   "name": "claude-desktop",
-  "version": "1.2.2",
+  "version": "1.3.0-beta.1",
   "description": "Claude AI – Native Desktop App für Linux",
   "main": "main.js",
   "homepage": "https://github.com/simongettkandt/claude-ai-desktop-app",
@@ -26,17 +26,6 @@
       "owner": "simongettkandt",
       "repo": "claude-ai-desktop-app"
     },
-    "files": [
-      "main.js",
-      "preload-tabbar.js",
-      "inject/**/*",
-      "icon.png",
-      "icon-original.png",
-      "package.json",
-      "node_modules/**/*",
-      "!node_modules/*/{test,tests,__tests__,docs,doc,example,examples}/**",
-      "!**/*.{md,ts,map,d.ts}"
-    ],
     "linux": {
       "target": [
         "AppImage"
@@ -47,6 +36,29 @@
       "description": "Eine schnelle, native Desktop-App für Claude AI",
       "maintainer": "Simon Gettkandt"
     },
+    "electronLanguages": [
+      "en-US",
+      "de"
+    ],
+    "compression": "maximum",
+    "asar": true,
+    "files": [
+      "main.js",
+      "preload-tabbar.js",
+      "preload-settings.js",
+      "preload-quickprompt.js",
+      "preload-whatsnew.js",
+      "inject/**/*",
+      "icon.png",
+      "icon-original.png",
+      "package.json",
+      "node_modules/**/*",
+      "!node_modules/*/{test,tests,__tests__,docs,doc,example,examples,benchmark,benchmarks}/**",
+      "!node_modules/**/*.{md,markdown,ts,map,d.ts,coffee,bak,log,h,c,cc,cpp,gyp,gypi,Makefile,mk}",
+      "!node_modules/**/{LICENSE,license,LICENCE,licence,CHANGELOG,changelog,HISTORY,history,AUTHORS,CONTRIBUTORS,NOTICE,README,readme}*",
+      "!node_modules/**/{.github,.idea,.vscode,.nyc_output,.eslintrc*,.prettierrc*,.editorconfig,.travis.yml,.gitignore,.gitattributes,.npmignore,tsconfig*.json,jest.config*,karma.conf*,webpack.config*,rollup.config*,gulpfile*,Gruntfile*}",
+      "!**/*.{md,ts,map,d.ts}"
+    ],
     "appImage": {
       "artifactName": "Claude-Desktop-${version}.AppImage"
     }

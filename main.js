@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, shell, Menu, nativeTheme, dialog, Notification, session, ipcMain, net } = require('electron');
+const { app, BrowserWindow, WebContentsView, shell, Menu, Tray, globalShortcut, nativeImage, nativeTheme, dialog, Notification, session, ipcMain, net, screen } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
@@ -152,6 +152,22 @@ const bugReportStrings = {
 const stateFile = path.join(app.getPath('userData'), 'window-state.json');
 let windowState = {};
 let lastSavedState = '';
+let tray = null;
+let isQuitting = false;
+let settingsWindow = null;
+let quickPromptWindow = null;
+let whatsNewWindow = null;
+let minimizeOnClose = false;
+let currentHotkey = null;
+
+const RELEASE_NOTES = {
+  '1.3.0': [
+    { icon: 'tray', title: 'Systemtray & Hintergrund-Modus', text: 'Claude l\u00e4uft jetzt im Hintergrund weiter und ist \u00fcber das Tray-Symbol erreichbar.' },
+    { icon: 'bolt', title: 'Globaler Quick-Prompt', text: 'Ein frei w\u00e4hlbarer Hotkey \u00f6ffnet ein Eingabefenster f\u00fcr neue Chats \u2013 direkt aus jeder App.' },
+    { icon: 'check', title: 'Update-Check mit Feedback', text: 'Das Men\u00fc zeigt jetzt klar an, ob ein Update bereitsteht oder die App aktuell ist.' },
+    { icon: 'settings', title: 'App-Einstellungen', text: 'Neuer Dialog f\u00fcr Tray-Verhalten und Hotkey \u2013 jederzeit \u00fcber das Men\u00fc erreichbar.' }
+  ]
+};
 
 function loadWindowState() {
   try {
@@ -159,17 +175,34 @@ function loadWindowState() {
   } catch {}
   if (windowState.customDesign !== undefined) customDesign = windowState.customDesign;
   if (windowState.isDarkMode !== undefined) isDarkMode = windowState.isDarkMode;
+  minimizeOnClose = windowState.minimizeOnClose === true;
+  currentHotkey = typeof windowState.hotkey === 'string' && windowState.hotkey.length > 0 ? windowState.hotkey : null;
   return {
     width: windowState.width || 1200, height: windowState.height || 800,
     x: windowState.x, y: windowState.y, isMaximized: windowState.isMaximized || false
   };
 }
 
+function buildState() {
+  const base = {
+    customDesign, isDarkMode,
+    minimizeOnClose,
+    hotkey: currentHotkey,
+    lastSeenVersion: windowState.lastSeenVersion || null
+  };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try {
+      const bounds = mainWindow.getBounds();
+      return { ...bounds, isMaximized: mainWindow.isMaximized(), ...base };
+    } catch {}
+  }
+  const prev = windowState || {};
+  return { width: prev.width, height: prev.height, x: prev.x, y: prev.y, isMaximized: prev.isMaximized === true, ...base };
+}
+
 const saveWindowState = debounce(() => {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
   try {
-    const bounds = mainWindow.getBounds();
-    const state = { ...bounds, isMaximized: mainWindow.isMaximized(), customDesign, isDarkMode };
+    const state = buildState();
     const json = JSON.stringify(state);
     if (json === lastSavedState) return;
     lastSavedState = json;
@@ -179,10 +212,9 @@ const saveWindowState = debounce(() => {
 }, 500);
 
 function saveWindowStateSync() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
   try {
-    const bounds = mainWindow.getBounds();
-    const state = { ...bounds, isMaximized: mainWindow.isMaximized(), customDesign, isDarkMode };
+    const state = buildState();
+    windowState = state;
     fs.writeFileSync(stateFile, JSON.stringify(state));
   } catch {}
 }
@@ -233,6 +265,17 @@ function theme()  { return isDarkMode ? THEME.dark : THEME.light; }
 function accent() { return customDesign ? ACCENT.custom : ACCENT.original; }
 function icon()   { return path.join(__dirname, customDesign ? 'icon.png' : 'icon-original.png'); }
 
+const _iconDataUrlCache = {};
+function iconDataUrl() {
+  const p = icon();
+  if (_iconDataUrlCache[p]) return _iconDataUrlCache[p];
+  try {
+    const b64 = fs.readFileSync(p).toString('base64');
+    _iconDataUrlCache[p] = `data:image/png;base64,${b64}`;
+  } catch { _iconDataUrlCache[p] = ''; }
+  return _iconDataUrlCache[p];
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Tab-Bar HTML
 // ═══════════════════════════════════════════════════════════════════
@@ -262,24 +305,32 @@ body{background:var(--bg);font:500 12px/1 -apple-system,BlinkMacSystemFont,'Sego
 .tab{display:flex;align-items:center;height:34px;padding:0 14px;border-radius:10px 10px 0 0;
   cursor:pointer;white-space:nowrap;max-width:220px;min-width:60px;gap:8px;
   position:relative;color:var(--t);transition:background .15s,color .15s;contain:layout style}
-.tab:hover{background:var(--bgh);color:var(--ta)}
-.tab.active{background:var(--bga);color:var(--ta)}
+.tab:hover{background:linear-gradient(180deg,transparent,var(--bgh));color:var(--ta)}
+.tab.active{background:var(--bga);color:var(--ta);
+  box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ac-from) 18%,transparent)}
 .tab.active::after{content:'';position:absolute;bottom:0;left:10px;right:10px;height:2.5px;
-  background:linear-gradient(90deg,var(--ac-from),var(--ac-to));border-radius:2px 2px 0 0}
+  background:linear-gradient(90deg,var(--ac-from),var(--ac-to));border-radius:2px 2px 0 0;
+  box-shadow:0 0 8px color-mix(in srgb,var(--ac-from) 45%,transparent)}
 .tab-title{flex:1;overflow:hidden;text-overflow:ellipsis}
 .tab-close{width:18px;height:18px;border-radius:6px;display:flex;align-items:center;justify-content:center;
   font-size:15px;line-height:1;opacity:0;flex-shrink:0;transition:opacity .1s,background .1s}
 .tab:hover .tab-close{opacity:.5}
-.tab-close:hover{opacity:1!important;background:var(--bgh);color:var(--ac-to)}
-.controls{display:flex;align-items:center;gap:2px;padding:0 6px 6px;-webkit-app-region:no-drag}
+.tab-close:hover{opacity:1!important;background:linear-gradient(135deg,var(--ac-from),var(--ac-to));color:#fff}
+.controls{display:flex;align-items:center;gap:4px;padding:0 6px 6px;-webkit-app-region:no-drag}
 .ctrl-btn{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
-  cursor:pointer;color:var(--ta);font-size:16px;opacity:.85;transition:background .15s,color .15s,opacity .15s}
-.ctrl-btn:hover{background:var(--bgh);color:var(--ac-to);opacity:1}
+  cursor:pointer;color:var(--ta);font-size:16px;opacity:.85;transition:all .15s;border:1px solid transparent}
+.ctrl-btn:hover{background:color-mix(in srgb,var(--ac-from) 12%,transparent);
+  border-color:color-mix(in srgb,var(--ac-from) 35%,transparent);color:var(--ac-from);opacity:1}
 .ctrl-btn svg{width:16px;height:16px}
-.design-pill{padding:2px 10px;height:22px;border-radius:11px;font-size:10px;font-weight:600;
+#new-tab{background:linear-gradient(135deg,var(--ac-from),var(--ac-to));color:#fff;opacity:1;
+  box-shadow:0 2px 8px color-mix(in srgb,var(--ac-from) 35%,transparent)}
+#new-tab:hover{background:linear-gradient(135deg,var(--ac-from),var(--ac-to));color:#fff;
+  border-color:transparent;filter:brightness(1.08)}
+.design-pill{padding:2px 11px;height:22px;border-radius:11px;font-size:10px;font-weight:600;
   letter-spacing:.4px;text-transform:uppercase;display:flex;align-items:center;cursor:pointer;
-  background:var(--bgh);color:var(--t);transition:all .15s;-webkit-app-region:no-drag;margin-right:2px}
-.design-pill:hover{background:var(--bga);color:var(--ac-to)}
+  background:var(--bgh);color:var(--t);transition:all .15s;-webkit-app-region:no-drag;margin-right:4px;
+  border:1px solid var(--bd)}
+.design-pill:hover{background:linear-gradient(135deg,var(--ac-from),var(--ac-to));color:#fff;border-color:transparent}
 </style></head><body>
 <div id="tabs"></div>
 <div class="controls">
@@ -287,12 +338,12 @@ body{background:var(--bg);font:500 12px/1 -apple-system,BlinkMacSystemFont,'Sego
   <div class="ctrl-btn" id="bug-report" title="${(bugReportStrings[sysLang] || bugReportStrings.en).title}">
     <svg viewBox="0 0 24 24" fill="none"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
   </div>
-  <div class="ctrl-btn" id="new-tab" title="${t('Neuer Tab', 'New Tab')} (Ctrl+T)">
-    <svg viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg>
-  </div>
   <div class="ctrl-btn" id="theme-toggle" title="${t('Theme wechseln', 'Toggle theme')}">
     <svg id="theme-icon-dark" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
     <svg id="theme-icon-light" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="5" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
+  </div>
+  <div class="ctrl-btn" id="new-tab" title="${t('Neuer Tab', 'New Tab')} (Ctrl+T)">
+    <svg viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg>
   </div>
 </div>
 <script>
@@ -668,8 +719,10 @@ function showBugReportDialog() {
   const sub = dark ? '#9a9a96' : '#8a7e72';
   const btnBg = '#E8524F';
 
+  const brSize = { width: 420, height: 260 };
+  const brPos = centerOnMainDisplay(brSize.width, brSize.height);
   const win = new BrowserWindow({
-    width: 420, height: 260, resizable: false,
+    ...brSize, ...brPos, resizable: false,
     parent: mainWindow, modal: true,
     title: s.title, icon: icon(),
     backgroundColor: bg,
@@ -697,6 +750,465 @@ button:hover{background:#F0635C}
 </body></html>`;
 
   win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tray, Hintergrund-Modus, globaler Hotkey
+// ═══════════════════════════════════════════════════════════════════
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  mainWindow.focus();
+}
+
+function toggleMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isVisible() && !mainWindow.isMinimized() && mainWindow.isFocused()) mainWindow.hide();
+  else showMainWindow();
+}
+
+function openNewChatFromHotkey() {
+  showMainWindow();
+  createTab('https://claude.ai/new');
+}
+
+function getQuickPromptHTML() {
+  const th = theme();
+  const ac = accent();
+  const i18n = {
+    placeholder: t('Frage an Claude\u2026', 'Ask Claude\u2026'),
+    hint: t('Enter zum Senden \u00b7 Shift+Enter neue Zeile \u00b7 Esc abbrechen', 'Enter to send \u00b7 Shift+Enter new line \u00b7 Esc to cancel')
+  };
+  const logoUrl = iconDataUrl();
+  return `<!DOCTYPE html><html><head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:;">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:transparent;color:${th.textActive};font-family:system-ui,-apple-system,sans-serif;font-size:14px;overflow:hidden}
+body{padding:10px}
+@keyframes gradShift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+.frame{height:100%;border-radius:12px;padding:2px;
+  background:linear-gradient(135deg,${ac.from},${ac.to},${ac.from},${ac.to});
+  background-size:300% 300%;
+  animation:gradShift 6s ease-in-out infinite;
+  box-shadow:0 8px 32px rgba(0,0,0,.35), 0 0 24px color-mix(in srgb,${ac.from} 30%,transparent)}
+.inner{height:100%;background:${th.bg};border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.wrap{flex:1;display:flex;align-items:flex-start;gap:12px}
+.logo{width:28px;height:28px;flex-shrink:0;border-radius:7px;margin-top:4px;object-fit:contain;
+  box-shadow:0 2px 8px color-mix(in srgb,${ac.from} 40%,transparent)}
+textarea{flex:1;background:transparent;border:none;outline:none;resize:none;color:${th.textActive};font-family:inherit;font-size:15px;line-height:1.5;min-height:60px;padding:4px 0}
+textarea::placeholder{color:${th.text}}
+.hint{color:${th.text};font-size:11px;text-align:right}
+</style></head><body>
+<div class="frame"><div class="inner">
+<div class="wrap">
+  <img class="logo" src="${logoUrl}" alt="Claude"/>
+  <textarea id="q" placeholder="${i18n.placeholder}" autofocus></textarea>
+</div>
+<div class="hint">${i18n.hint}</div>
+</div></div>
+<script>
+const api = window.quickPromptAPI;
+const q = document.getElementById('q');
+q.focus();
+q.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { e.preventDefault(); api.cancel(); return; }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const v = q.value.trim();
+    if (v.length === 0) { api.cancel(); return; }
+    api.submit(v);
+  }
+});
+</script>
+</body></html>`;
+}
+
+function openQuickPrompt() {
+  if (quickPromptWindow && !quickPromptWindow.isDestroyed()) {
+    quickPromptWindow.show();
+    quickPromptWindow.focus();
+    return;
+  }
+  const qpSize = { width: 600, height: 160 };
+  const qpPos = centerOnMainDisplay(qpSize.width, qpSize.height);
+  quickPromptWindow = new BrowserWindow({
+    ...qpSize, ...qpPos,
+    frame: false, resizable: false, movable: true,
+    alwaysOnTop: true, skipTaskbar: true, show: false,
+    transparent: true, hasShadow: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-quickprompt.js'),
+      nodeIntegration: false, contextIsolation: true, sandbox: true,
+      spellcheck: false
+    }
+  });
+  quickPromptWindow.setMenu(null);
+  quickPromptWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(getQuickPromptHTML()));
+  quickPromptWindow.once('ready-to-show', () => {
+    if (!quickPromptWindow || quickPromptWindow.isDestroyed()) return;
+    quickPromptWindow.show();
+    quickPromptWindow.focus();
+  });
+  quickPromptWindow.on('blur', () => {
+    if (quickPromptWindow && !quickPromptWindow.isDestroyed()) quickPromptWindow.close();
+  });
+  quickPromptWindow.on('closed', () => { quickPromptWindow = null; });
+}
+
+function submitQuickPrompt(text) {
+  if (typeof text !== 'string') return;
+  const trimmed = text.trim();
+  if (trimmed.length === 0 || trimmed.length > 8000) return;
+  showMainWindow();
+  const tab = createTab('https://claude.ai/new');
+  if (!tab || !alive(tab.view)) return;
+  const wc = tab.view.webContents;
+  const escaped = JSON.stringify(trimmed);
+  const inject = () => {
+    wc.executeJavaScript(`(function(){
+      const prompt = ${escaped};
+      let attempts = 0;
+      const tryFill = () => {
+        attempts++;
+        if (attempts > 80) return;
+        const el = document.querySelector('div[contenteditable="true"].ProseMirror') || document.querySelector('div[contenteditable="true"]') || document.querySelector('.ProseMirror');
+        if (!el) { setTimeout(tryFill, 150); return; }
+        try {
+          el.focus();
+          const sel = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand('insertText', false, prompt);
+        } catch(e) {}
+        setTimeout(() => {
+          const btns = Array.from(document.querySelectorAll('button'));
+          const btn = btns.find(b => {
+            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+            return a.includes('send') || a.includes('senden') || a.includes('abschicken');
+          });
+          if (btn && !btn.disabled) { btn.click(); return; }
+          const enter = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+          (el || document.activeElement).dispatchEvent(enter);
+        }, 250);
+      };
+      tryFill();
+    })();`).catch(() => {});
+  };
+  wc.once('did-finish-load', inject);
+}
+
+function centerOnMainDisplay(width, height) {
+  try {
+    let display;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      display = screen.getDisplayMatching(mainWindow.getBounds());
+    } else {
+      display = screen.getPrimaryDisplay();
+    }
+    const wa = display.workArea;
+    return {
+      x: Math.round(wa.x + (wa.width - width) / 2),
+      y: Math.round(wa.y + (wa.height - height) / 2)
+    };
+  } catch {
+    return {};
+  }
+}
+
+function setupTray() {
+  if (tray) return;
+  try {
+    let img = nativeImage.createFromPath(icon());
+    if (!img.isEmpty()) img = img.resize({ width: 22, height: 22, quality: 'best' });
+    tray = new Tray(img.isEmpty() ? icon() : img);
+    tray.setToolTip('Claude');
+    tray.on('click', toggleMainWindow);
+    updateTrayMenu();
+  } catch (e) {
+    tray = null;
+  }
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
+  try {
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: t('\u00d6ffnen', 'Open'), click: showMainWindow },
+      { label: t('Neuer Chat', 'New Chat'), click: openNewChatFromHotkey },
+      { type: 'separator' },
+      { label: t('App-Einstellungen\u2026', 'App Settings\u2026'), click: () => openSettingsWindow() },
+      { type: 'separator' },
+      { label: t('Beenden', 'Quit'), click: () => { isQuitting = true; app.quit(); } }
+    ]));
+  } catch {}
+}
+
+function registerHotkey(accel) {
+  if (currentHotkey) {
+    try { globalShortcut.unregister(currentHotkey); } catch {}
+  }
+  currentHotkey = null;
+  if (!accel || typeof accel !== 'string') return true;
+  try {
+    const ok = globalShortcut.register(accel, openQuickPrompt);
+    if (ok) { currentHotkey = accel; return true; }
+  } catch {}
+  return false;
+}
+
+function getSettingsHTML() {
+  const th = theme();
+  const ac = accent();
+  const i18n = {
+    title: t('Einstellungen', 'Settings'),
+    subtitle: t('Hintergrund-Modus und globaler Hotkey', 'Background mode and global hotkey'),
+    minimizeLabel: t('Beim Schlie\u00dfen in den Hintergrund minimieren', 'Minimize to tray on close'),
+    minimizeHint: t('Claude bleibt im Hintergrund erreichbar \u2013 \u00fcber das Tray-Symbol oder den Hotkey unten.', 'Claude stays reachable in the background \u2013 via the tray icon or the hotkey below.'),
+    hotkeyLabel: t('Globaler Hotkey (neuer Chat)', 'Global hotkey (new chat)'),
+    press: t('Klick hier und dr\u00fccke eine Tastenkombination', 'Click here and press a key combination'),
+    pressing: t('Dr\u00fccke die gew\u00fcnschte Tastenkombination\u2026', 'Press your key combination\u2026'),
+    clear: t('L\u00f6schen', 'Clear'),
+    close: t('Schlie\u00dfen', 'Close'),
+    registered: t('Hotkey registriert.', 'Hotkey registered.'),
+    failed: t('Diese Kombination konnte nicht registriert werden (evtl. systemweit belegt).', 'Could not register this combination (may already be in use).'),
+    removed: t('Hotkey entfernt.', 'Hotkey removed.'),
+    needMod: t('Bitte mindestens eine Modifikator-Taste (Strg/Alt/Shift) verwenden.', 'Please use at least one modifier key (Ctrl/Alt/Shift).')
+  };
+  return `<!DOCTYPE html><html><head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:22px;background:${th.bg};color:${th.textActive};font-family:system-ui,-apple-system,sans-serif;font-size:14px;user-select:none}
+h1{font-size:17px;margin:0 0 4px;font-weight:600}
+.sub{color:${th.text};font-size:12px;margin-bottom:18px}
+.row{margin:14px 0}
+label{display:block;margin-bottom:6px;font-weight:500}
+.chk{display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-weight:500}
+.chk input{margin-top:2px;accent-color:${ac.from}}
+.hint{color:${th.text};font-size:12px;margin-top:4px;margin-left:24px;line-height:1.5}
+.hotkey{display:flex;gap:8px;align-items:center}
+.capture{flex:1;padding:10px 12px;background:${th.bgHover};border:1px solid ${th.border};border-radius:6px;font-family:monospace;cursor:pointer;color:${th.textActive};outline:none;min-height:38px;display:flex;align-items:center}
+.capture.listening{border-color:${ac.from};background:${th.bgActive}}
+button{background:linear-gradient(135deg,${ac.from},${ac.to});color:#fff;border:none;padding:9px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+button.secondary{background:${th.bgHover};color:${th.textActive};border:1px solid ${th.border}}
+button:hover{filter:brightness(1.05)}
+.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:22px}
+.status{color:${th.text};font-size:12px;margin-top:6px;min-height:16px}
+</style></head><body>
+<h1>${i18n.title}</h1>
+<div class="sub">${i18n.subtitle}</div>
+
+<div class="row">
+  <label class="chk"><input type="checkbox" id="mc"><span>${i18n.minimizeLabel}</span></label>
+  <div class="hint">${i18n.minimizeHint}</div>
+</div>
+
+<div class="row">
+  <label>${i18n.hotkeyLabel}</label>
+  <div class="hotkey">
+    <div class="capture" id="cap" tabindex="0">${i18n.press}</div>
+    <button class="secondary" id="clear">${i18n.clear}</button>
+  </div>
+  <div class="status" id="status"></div>
+</div>
+
+<div class="actions">
+  <button id="close">${i18n.close}</button>
+</div>
+
+<script>
+const I = ${JSON.stringify(i18n)};
+const api = window.settingsAPI;
+const mc = document.getElementById('mc');
+const cap = document.getElementById('cap');
+const clearBtn = document.getElementById('clear');
+const closeBtn = document.getElementById('close');
+const status = document.getElementById('status');
+let listening = false;
+let currentDisplay = I.press;
+
+function resetCapture() {
+  listening = false;
+  cap.classList.remove('listening');
+  cap.textContent = currentDisplay;
+}
+
+api.get().then(s => {
+  mc.checked = !!s.minimizeOnClose;
+  if (s.hotkey) { currentDisplay = s.hotkey; cap.textContent = s.hotkey; }
+});
+
+mc.addEventListener('change', () => api.setMinimize(mc.checked));
+
+cap.addEventListener('click', () => {
+  listening = true;
+  cap.classList.add('listening');
+  cap.textContent = I.pressing;
+  status.textContent = '';
+  cap.focus();
+});
+
+cap.addEventListener('blur', () => { if (listening) resetCapture(); });
+
+cap.addEventListener('keydown', (e) => {
+  if (!listening) return;
+  e.preventDefault();
+  const k = e.key;
+  if (k === 'Escape') { resetCapture(); return; }
+  if (['Control','Shift','Alt','Meta','Dead','Unidentified'].includes(k)) return;
+  const parts = [];
+  if (e.ctrlKey || e.metaKey) parts.push('CommandOrControl');
+  if (e.altKey) parts.push('Alt');
+  if (e.shiftKey) parts.push('Shift');
+  if (parts.length === 0) { status.textContent = I.needMod; return; }
+  let key = k;
+  if (key === ' ') key = 'Space';
+  else if (key.length === 1) key = key.toUpperCase();
+  parts.push(key);
+  const accel = parts.join('+');
+  api.setHotkey(accel).then(ok => {
+    if (ok) { currentDisplay = accel; status.textContent = I.registered; }
+    else { status.textContent = I.failed; }
+    resetCapture();
+  });
+});
+
+clearBtn.addEventListener('click', () => {
+  api.setHotkey(null).then(() => {
+    currentDisplay = I.press;
+    cap.textContent = I.press;
+    status.textContent = I.removed;
+  });
+});
+
+closeBtn.addEventListener('click', () => api.close());
+</script>
+</body></html>`;
+}
+
+function getWhatsNewHTML() {
+  const th = theme();
+  const ac = accent();
+  const notes = RELEASE_NOTES[version] || [];
+  const icons = {
+    tray: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="12" cy="12" r="3"/></svg>',
+    bolt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 4 14 12 14 11 22 20 10 12 10 13 2"/></svg>',
+    check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="8 12 11 15 16 9"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>'
+  };
+  const i18n = {
+    header: t('Neu in Claude v' + version, 'New in Claude v' + version),
+    sub: t('Ein kurzer \u00dcberblick \u00fcber die wichtigsten \u00c4nderungen', 'A quick look at the highlights'),
+    close: t('Los geht\u2019s', 'Let\u2019s go'),
+    openSettings: t('App-Einstellungen \u00f6ffnen', 'Open app settings')
+  };
+  const items = notes.map(n => `
+    <div class="item">
+      <div class="ic">${icons[n.icon] || icons.check}</div>
+      <div>
+        <div class="it">${n.title}</div>
+        <div class="ix">${n.text}</div>
+      </div>
+    </div>`).join('');
+  return `<!DOCTYPE html><html><head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:;">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:${th.bg};color:${th.textActive};font-family:system-ui,-apple-system,sans-serif;font-size:14px;user-select:none}
+body{display:flex;flex-direction:column;overflow:hidden}
+.hero{position:relative;padding:28px 28px 24px;background:linear-gradient(135deg,${ac.from},${ac.to});color:#fff;overflow:hidden}
+.hero::before{content:'';position:absolute;right:-60px;top:-60px;width:200px;height:200px;border-radius:50%;background:rgba(255,255,255,.12)}
+.hero::after{content:'';position:absolute;right:30px;bottom:-40px;width:120px;height:120px;border-radius:50%;background:rgba(255,255,255,.08)}
+.badge{display:inline-block;background:rgba(255,255,255,.2);padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;margin-bottom:10px;position:relative;z-index:1}
+h1{font-size:22px;font-weight:700;position:relative;z-index:1;margin-bottom:6px}
+.hs{font-size:13px;opacity:.9;position:relative;z-index:1}
+.body{flex:1;padding:22px 28px;overflow-y:auto;display:flex;flex-direction:column;gap:16px}
+.body::-webkit-scrollbar{width:8px}
+.body::-webkit-scrollbar-thumb{background:${th.border};border-radius:4px}
+.item{display:flex;gap:14px;align-items:flex-start}
+.ic{width:36px;height:36px;flex-shrink:0;border-radius:9px;background:${th.bgHover};border:1px solid ${th.border};display:flex;align-items:center;justify-content:center;color:${ac.from}}
+.ic svg{width:18px;height:18px}
+.it{font-weight:600;font-size:14px;margin-bottom:2px}
+.ix{color:${th.text};font-size:12px;line-height:1.5}
+.footer{padding:16px 28px 20px;display:flex;justify-content:space-between;align-items:center;gap:10px;border-top:1px solid ${th.border}}
+button{background:linear-gradient(135deg,${ac.from},${ac.to});color:#fff;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
+button.secondary{background:${th.bgHover};color:${th.textActive};border:1px solid ${th.border}}
+button:hover{filter:brightness(1.05)}
+</style></head><body>
+<div class="hero">
+  <div class="badge">v${version}</div>
+  <h1>${i18n.header}</h1>
+  <div class="hs">${i18n.sub}</div>
+</div>
+<div class="body">${items}</div>
+<div class="footer">
+  <button class="secondary" id="opts">${i18n.openSettings}</button>
+  <button id="close">${i18n.close}</button>
+</div>
+<script>
+document.getElementById('close').addEventListener('click', () => window.whatsNewAPI.close());
+document.getElementById('opts').addEventListener('click', () => window.whatsNewAPI.openSettings());
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' || e.key === 'Enter') window.whatsNewAPI.close(); });
+</script>
+</body></html>`;
+}
+
+function openWhatsNewWindow() {
+  if (whatsNewWindow && !whatsNewWindow.isDestroyed()) {
+    whatsNewWindow.focus();
+    return;
+  }
+  const size = { width: 520, height: 560 };
+  const pos = centerOnMainDisplay(size.width, size.height);
+  whatsNewWindow = new BrowserWindow({
+    ...size, ...pos,
+    parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+    modal: false, resizable: false, minimizable: false, maximizable: false,
+    title: t('Neu in Claude', 'What\u2019s new in Claude'),
+    backgroundColor: theme().bg,
+    icon: icon(),
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-whatsnew.js'),
+      nodeIntegration: false, contextIsolation: true, sandbox: true,
+      spellcheck: false
+    }
+  });
+  whatsNewWindow.setMenu(null);
+  whatsNewWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(getWhatsNewHTML()));
+  whatsNewWindow.on('closed', () => { whatsNewWindow = null; });
+}
+
+function openSettingsWindow() {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.focus();
+    return;
+  }
+  const swSize = { width: 540, height: 440 };
+  const swPos = centerOnMainDisplay(swSize.width, swSize.height);
+  settingsWindow = new BrowserWindow({
+    ...swSize, ...swPos,
+    parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+    modal: false, resizable: false, minimizable: false, maximizable: false,
+    title: t('Claude \u2013 Einstellungen', 'Claude \u2013 Settings'),
+    backgroundColor: theme().bg,
+    icon: icon(),
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-settings.js'),
+      nodeIntegration: false, contextIsolation: true, sandbox: true,
+      spellcheck: false
+    }
+  });
+  settingsWindow.setMenu(null);
+  settingsWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(getSettingsHTML()));
+  settingsWindow.on('closed', () => { settingsWindow = null; });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -731,10 +1243,16 @@ function updateMenu(force = false) {
           if (tabs[activeTabIndex] && alive(tabs[activeTabIndex].view))
             tabs[activeTabIndex].view.webContents.loadURL('https://claude.ai/settings');
         }},
+        { label: t('App-Einstellungen\u2026', 'App Settings\u2026'), click: () => openSettingsWindow() },
         { type: 'separator' },
         { label: `Design: ${customDesign ? 'Modern' : 'Classic'}`, click: toggleDesign },
         { label: t('Nach Updates suchen\u2026', 'Check for Updates\u2026'), click: () => {
-          if (!isDev) autoUpdater.checkForUpdates().catch(() => {});
+          if (isDev) {
+            dialog.showMessageBox(mainWindow, { type: 'info', title: 'Claude', message: t('Updates sind im Entwicklungsmodus deaktiviert.', 'Updates are disabled in development mode.') });
+            return;
+          }
+          manualUpdateCheck = true;
+          autoUpdater.checkForUpdates().catch(() => {});
         }},
         { label: (bugReportStrings[sysLang] || bugReportStrings.en).title, click: showBugReportDialog },
         { type: 'separator' },
@@ -855,6 +1373,7 @@ function setupDownloadManager() {
 
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
+let manualUpdateCheck = false;
 
 function setupAutoUpdater() {
   if (isDev) return;
@@ -862,7 +1381,20 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-available', (info) => {
     failures = 0;
-    new Notification({ title: t('Update verf\u00fcgbar', 'Update available'), body: `v${info.version} ${t('wird geladen\u2026', 'downloading\u2026')}` }).show();
+    if (manualUpdateCheck) {
+      manualUpdateCheck = false;
+      dialog.showMessageBox(mainWindow, { type: 'info', title: t('Update verf\u00fcgbar', 'Update available'), message: `v${info.version} ${t('wird heruntergeladen\u2026', 'is downloading\u2026')}` });
+    } else {
+      new Notification({ title: t('Update verf\u00fcgbar', 'Update available'), body: `v${info.version} ${t('wird geladen\u2026', 'downloading\u2026')}` }).show();
+    }
+  });
+
+  autoUpdater.on('update-not-available', (info) => {
+    failures = 0;
+    if (manualUpdateCheck) {
+      manualUpdateCheck = false;
+      dialog.showMessageBox(mainWindow, { type: 'info', title: t('Kein Update', 'No Update'), message: t('Du verwendest bereits die neueste Version.', 'You are already on the latest version.'), detail: `v${app.getVersion()}` });
+    }
   });
 
   autoUpdater.on('download-progress', (p) => {
@@ -884,6 +1416,11 @@ function setupAutoUpdater() {
   autoUpdater.on('error', (err) => {
     failures++;
     if (isDev) console.error(`Update-Fehler (${failures}x):`, err.message);
+    if (manualUpdateCheck) {
+      manualUpdateCheck = false;
+      const short = (err.message || '').split('\n')[0].slice(0, 200);
+      dialog.showMessageBox(mainWindow, { type: 'error', title: t('Update-Fehler', 'Update Error'), message: t('Update-Pr\u00fcfung fehlgeschlagen.', 'Update check failed.'), detail: short });
+    }
   });
 
   autoUpdater.checkForUpdates().catch(() => {});
@@ -907,9 +1444,18 @@ function setupSession() {
   ses.setPermissionRequestHandler((_, perm, cb) => cb(allowed.has(perm)));
   ses.setPermissionCheckHandler((_, perm) => allowed.has(perm));
 
+  ses.setUserAgent(chromeUA);
+
+  const chromeMajor = process.versions.chrome.split('.')[0];
+  const secChUa = `"Chromium";v="${chromeMajor}", "Not(A:Brand";v="24", "Google Chrome";v="${chromeMajor}"`;
+
   ses.webRequest.onBeforeSendHeaders({ urls: ['*://*.claude.ai/*'] }, (details, cb) => {
-    details.requestHeaders['DNT'] = '1';
-    cb({ requestHeaders: details.requestHeaders });
+    const h = details.requestHeaders;
+    h['DNT'] = '1';
+    h['Sec-Ch-Ua'] = secChUa;
+    h['Sec-Ch-Ua-Mobile'] = '?0';
+    h['Sec-Ch-Ua-Platform'] = '"Linux"';
+    cb({ requestHeaders: h });
   });
 
   // Preconnect (mehr Sockets für schnellere erste Requests)
@@ -921,6 +1467,37 @@ function setupSession() {
 // ═══════════════════════════════════════════════════════════════════
 //  IPC-Handler
 // ═══════════════════════════════════════════════════════════════════
+
+ipcMain.handle('settings-get', () => ({ minimizeOnClose, hotkey: currentHotkey }));
+ipcMain.on('settings-minimize', (_, v) => {
+  minimizeOnClose = v === true;
+  saveWindowState();
+});
+ipcMain.handle('settings-hotkey', (_, accel) => {
+  const value = (typeof accel === 'string' && accel.length > 0 && accel.length < 64) ? accel : null;
+  const ok = registerHotkey(value);
+  saveWindowState();
+  return ok;
+});
+ipcMain.on('settings-close', () => {
+  if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.close();
+});
+
+ipcMain.on('quickprompt-submit', (_, text) => {
+  if (quickPromptWindow && !quickPromptWindow.isDestroyed()) quickPromptWindow.close();
+  submitQuickPrompt(text);
+});
+ipcMain.on('quickprompt-cancel', () => {
+  if (quickPromptWindow && !quickPromptWindow.isDestroyed()) quickPromptWindow.close();
+});
+
+ipcMain.on('whatsnew-close', () => {
+  if (whatsNewWindow && !whatsNewWindow.isDestroyed()) whatsNewWindow.close();
+});
+ipcMain.on('whatsnew-open-settings', () => {
+  if (whatsNewWindow && !whatsNewWindow.isDestroyed()) whatsNewWindow.close();
+  openSettingsWindow();
+});
 
 ipcMain.on('tab-new', () => createTab());
 ipcMain.on('tab-switch', (_, i) => {
@@ -982,6 +1559,13 @@ function createWindow() {
   mainWindow.on('maximize', saveWindowState);
   mainWindow.on('unmaximize', saveWindowState);
 
+  mainWindow.on('close', (e) => {
+    if (!isQuitting && minimizeOnClose && tray) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
     tabs.forEach(t => {
@@ -1019,10 +1603,33 @@ app.whenReady().then(() => {
   updateMenu(true);
   setupDownloadManager();
   setupAutoUpdater();
+  setupTray();
+  if (currentHotkey) registerHotkey(currentHotkey);
   handleOnlineChange(net.isOnline());
   setInterval(() => handleOnlineChange(net.isOnline()), ONLINE_CHECK_MS);
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+
+  if (mainWindow && windowState.lastSeenVersion !== version && RELEASE_NOTES[version]) {
+    mainWindow.once('ready-to-show', () => {
+      setTimeout(() => {
+        openWhatsNewWindow();
+        windowState.lastSeenVersion = version;
+        saveWindowStateSync();
+      }, 1200);
+    });
+  }
 });
 
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', saveWindowStateSync);
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  isQuitting = true;
+  saveWindowStateSync();
+});
+
+app.on('will-quit', () => {
+  try { globalShortcut.unregisterAll(); } catch {}
+  if (tray) { try { tray.destroy(); } catch {} tray = null; }
+});
