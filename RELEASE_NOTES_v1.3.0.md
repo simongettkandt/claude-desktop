@@ -1,188 +1,188 @@
 # Claude Desktop v1.3.0 — Productivity Release
 
-**Veröffentlicht:** 2026-04-22
-**Vorherige Version:** [v1.2.2](./RELEASE_NOTES_v1.2.2.md)
+**Released:** 2026-04-22
+**Previous version:** [v1.2.2](./RELEASE_NOTES_v1.2.2.md)
 
-Das größte Feature-Update seit v1.2.0. Drei neue Fenster, System-Tray-Integration, globaler Hotkey, umfassende Performance-Optimierung und eine kleinere AppImage.
-
----
-
-## Das Wichtigste in Kürze
-
-| Bereich | Neu in v1.3.0 |
-|---------|---------------|
-| **Produktivität** | Globaler Hotkey + Quick-Prompt-Fenster, System-Tray, App-Einstellungen |
-| **UI** | What's-New-Popup, Update-Check-Dialoge, Tab-Bar-Akzente am Logo-Gradient |
-| **Performance** | Hintergrund-Drosselung aktiver Tab, AppImage ~17 % kleiner |
-| **Stabilität** | 19+ Bugfixes aus systematischem Code-Review |
-| **Sicherheit** | Electron 41.2.1 (3 CVEs), Hotkey-Validierung, IPC-Sender-Checks |
+The biggest feature update since v1.2.0. Three new windows, system-tray integration, a global hotkey, comprehensive performance tuning, and a smaller AppImage.
 
 ---
 
-## Neue Features
+## At a glance
 
-### System-Tray & Hintergrund-Modus
+| Area | New in v1.3.0 |
+|------|---------------|
+| **Productivity** | Global hotkey + Quick-Prompt window, system tray, App Settings |
+| **UI** | What's-New popup, update-check dialogs, tab-bar accents in logo gradient |
+| **Performance** | Background throttling for the active tab, ~17 % smaller AppImage |
+| **Stability** | 19+ bug fixes from a systematic code review |
+| **Security** | Electron 41.2.1 (3 CVEs), hotkey validation, IPC sender checks |
 
-Claude läuft jetzt optional im Hintergrund weiter. Beim Schließen des Fensters minimiert die App ins Tray (optional, standardmäßig aus), bleibt über das Tray-Symbol erreichbar oder wird per Hotkey geholt.
+---
 
-- Tray-Menü: **Öffnen** · **Neuer Chat** · **App-Einstellungen** · **Beenden**
-- Klick aufs Tray-Symbol toggelt das Hauptfenster
-- Persistiert in `window-state.json` (`minimizeOnClose`)
+## New features
 
-### Globaler Quick-Prompt-Hotkey
+### System tray & background mode
 
-Ein frei wählbarer, systemweiter Hotkey öffnet ein schlankes Eingabefenster mit animiertem Gradient-Rahmen. Text wird in einen neuen Chat bei `claude.ai/new` injiziert und automatisch abgeschickt.
+Claude can now keep running in the background. Closing the window minimizes the app to the tray (opt-in, disabled by default); it stays reachable through the tray icon or the global hotkey.
+
+- Tray menu: **Open** · **New Chat** · **App Settings** · **Quit**
+- Click on the tray icon toggles the main window
+- Preference persisted in `window-state.json` (`minimizeOnClose`)
+
+### Global Quick-Prompt hotkey
+
+A freely configurable, system-wide hotkey opens a slim input window with an animated gradient frame. Text is injected into a fresh chat at `claude.ai/new` and submitted automatically.
 
 - Transparent, frameless, always-on-top
-- Auto-fokussiertes Textfeld, Enter sendet, Shift+Enter Zeilenumbruch, Esc abbricht
-- Akzeptiert Key-Kombinationen wie `Alt+C`, `CmdOrCtrl+Shift+Space`, etc.
-- Validierte Accelerator-Syntax (siehe Sicherheit)
+- Auto-focused textarea: **Enter** sends, **Shift+Enter** inserts a newline, **Esc** cancels
+- Accepts key combinations like `Alt+C`, `CmdOrCtrl+Shift+Space`, etc.
+- Accelerator syntax is validated (see Security)
 
-### App-Einstellungen-Fenster
+### App Settings window
 
-Neuer Dialog im Fenstermenü unter **Claude → App-Einstellungen…**:
+A new dialog accessible from the window menu via **Claude → App Settings…**:
 
-- Hintergrund-Modus (Minimize-to-Tray) an/aus
-- Globaler Hotkey setzen (interaktives Tastenkombinations-Capture) oder löschen
-- Einstellungen werden sofort und persistent gespeichert
+- Toggle background mode (minimize-to-tray)
+- Set the global hotkey via interactive key-capture, or clear it
+- Changes are applied immediately and persisted
 
-### What's-New-Popup
+### What's-New popup
 
-Einmalig nach jeder Versions-Aktualisierung wird ein Changelog-Fenster angezeigt. Triggert bei Versionswechsel, merkt sich die zuletzt gesehene Version und erscheint beim nächsten Start nicht mehr.
+Shown once after each version update. Triggers on version change, remembers the last-seen version, and is suppressed on subsequent launches.
 
-- Über `lastSeenVersion` in `window-state.json` gesteuert
-- Öffnet automatisch die App-Einstellungen, wenn der Nutzer das im Popup wählt
+- Controlled by `lastSeenVersion` in `window-state.json`
+- Includes an **Open App Settings** shortcut
 
-### Update-Check mit Feedback-Dialogs
+### Update-check feedback dialogs
 
-Das Menü zeigt jetzt klare Dialoge bei **Update verfügbar**, **Kein Update**, **Update-Fehler**. Bisher lief der Update-Check still im Hintergrund.
+The **Check for Updates** menu entry now shows clear dialogs for **Update available**, **No update**, and **Update error**. Previously the check ran silently in the background.
 
-### Multi-Monitor-Fix
+### Multi-monitor fix
 
-Alle Child-Fenster (Quick-Prompt, Settings, What's-New) zentrieren auf dem Display der Hauptapp, nicht mehr auf dem Primary-Display. Verhindert "Fenster öffnet auf falschem Monitor".
+All child windows (Quick-Prompt, Settings, What's-New) now center on the display hosting the main window, not on the system's primary display. Fixes "window opens on the wrong monitor".
 
 ---
 
 ## Performance
 
-### Hintergrund-Drosselung
+### Background throttling
 
-Die aktive Tab-View (claude.ai) wurde bisher **nicht** gedrosselt, wenn die App minimiert oder im Tray versteckt war — selbst eine Streaming-Antwort lief mit voller CPU weiter.
+The active tab view (claude.ai) was previously **not** throttled when the app was minimized or hidden in the tray — even a streaming response kept using full CPU.
 
-Jetzt:
+Now:
 
-| Situation | Frame-Rate | CPU-Throttling |
-|-----------|------------|----------------|
-| Fenster sichtbar + fokussiert | 60 fps | aus |
-| **Minimiert oder im Tray** | **10 fps** | **an** |
-| Unfokussiert (sichtbar) | 60 fps | aus |
+| State | Frame rate | CPU throttling |
+|-------|------------|----------------|
+| Visible + focused | 60 fps | off |
+| **Minimized or in tray** | **10 fps** | **on** |
+| Visible but unfocused | 60 fps | off |
 
-Wird über Events `minimize` / `hide` / `show` / `restore` / `focus` auf `mainWindow` gesteuert.
+Wired up via `minimize` / `hide` / `show` / `restore` / `focus` events on the main window.
 
-### Kleineres AppImage
+### Smaller AppImage
 
-- `electronLanguages: ["en-US", "de"]` spart ~30 MB gegenüber dem vollen Locale-Satz
-- Erwartete Größe: **~103 MB** (v1.2.2 war ca. 120 MB)
-- Eigene UI-Strings gehen durch einen `t(de, en)`-Helper (kein i18n-Framework nötig)
+- `electronLanguages: ["en-US", "de"]` saves ~30 MB vs. the full locale set
+- Final size: **~103 MB** (v1.2.2 was ~120 MB)
+- Custom UI strings go through a lightweight `t(de, en)` helper — no i18n framework
 
-### Sonstige Performance-Fixes
+### Other performance fixes
 
-- `brand.js`: Schleife über alle Stylesheets läuft nur noch **einmal** pro Page-Load (per `varsFailed`-Flag). Vorher: Jeder Theme-Toggle löste eine vollständige Re-Iteration aus.
-- Console-Warn-Spam bei fehlendem Orange-Recoloring gestoppt.
+- `brand.js`: the full stylesheet iteration now runs **once** per page load (via a `varsFailed` flag). Previously every theme toggle triggered a complete re-scan.
+- Stopped recurring `console.warn` spam when orange CSS vars cannot be detected.
 
 ---
 
-## Stabilität & Bugfixes
+## Stability & bug fixes
 
-Alle bekannten Issues aus dem Fehlerbericht v1.2.2 sind behoben, plus Funde aus einem systematischen Deep-Review.
+All known issues from the internal v1.2.2 bug report are resolved, plus findings from a deep review.
 
-### Fixes aus Fehlerbericht v1.2.2
+### Fixes from v1.2.2 bug report
 
-| # | Problem | Fix |
-|---|---------|-----|
-| 1 | `brand.js`-Pfad brach App-Start | Datei unter `inject/brand.js`, konsistent mit `package.json` |
-| 2 | Auto-Updater-Backoff eskalierte dauerhaft | `failures = 0` auch bei `update-not-available` |
-| 3 | Variable-Shadowing der `t()`-i18n-Funktion | Arrow-Parameter `t` → `tb` in `tabs.find` |
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | `brand.js` path broke app startup | File moved to `inject/brand.js`, consistent with `package.json` |
+| 2 | Auto-updater back-off escalated permanently | `failures = 0` also on `update-not-available` |
+| 3 | Variable shadowing of the `t()` i18n function | Arrow parameter `t` → `tb` in `tabs.find` |
 | 4 | Shadowing in `mainWindow.on('closed')` | `t` → `tab` in `tabs.forEach` |
-| 5 | Theme-Toggle persistierte nicht | `saveWindowState()` im `theme-toggle`-IPC-Handler |
-| 6 | Fehlendes Fallback-Logging bei CSS-Var-Ausfall | `console.warn` mit Hinweis auf Classic-Design |
+| 5 | Theme toggle didn't persist | `saveWindowState()` called in the `theme-toggle` IPC handler |
+| 6 | Missing fallback logging on CSS-var failure | `console.warn` hint pointing at the Classic design |
 
-### Weitere Fixes
+### Additional fixes
 
-- **Layout-Abschnitt behoben** — Tab-View wird jetzt bei `maximize`, `unmaximize`, `enter-full-screen`, `leave-full-screen`, `show` und nach Tab-did-finish-load neu positioniert.
-- **What's-New-Timing** — Popup erscheint erst, wenn der claude.ai-Content geladen ist (vorher: schon während die rechte Seite noch leer war).
-- **Update-Dialogs crash-fest** — `dialog.showMessageBox` mit destroyed `mainWindow` prüft jetzt vorher.
-- **Interval-Cleanup** — `updateCheckInterval`, `onlineCheckInterval`, `waitForFirstTabInterval` werden in `before-quit` sauber gecleart.
-- **`second-instance`** — Holt die App korrekt aus dem Tray, statt nur zu fokussieren.
-- **Tray-Icon synchron** — Wird beim `toggleDesign` mit aktualisiert.
-- **RELEASE_NOTES-Duplikation** entfernt — `'1.3.0-beta.1'` ist Alias auf `'1.3.0'`.
+- **Layout clipping fixed** — the tab view is now repositioned on `maximize`, `unmaximize`, `enter-full-screen`, `leave-full-screen`, `show`, and after the tab's `did-finish-load`.
+- **What's-New timing** — popup appears only after claude.ai content has loaded (previously it opened while the right pane was still blank).
+- **Update dialogs crash-safe** — `dialog.showMessageBox` now guards against a destroyed `mainWindow`.
+- **Interval cleanup** — `updateCheckInterval`, `onlineCheckInterval`, and `waitForFirstTabInterval` are cleared on `before-quit`.
+- **`second-instance`** — correctly restores the app from the tray instead of only focusing.
+- **Tray icon in sync** — updated alongside `toggleDesign`.
+- **Deduplicated `RELEASE_NOTES`** — `'1.3.0-beta.1'` is now an alias for `'1.3.0'`.
 
 ---
 
-## Sicherheit
+## Security
 
-- **Electron 41.0.4 → 41.2.1** — schließt 3 CVEs
+- **Electron 41.0.4 → 41.2.1** — closes 3 CVEs
 - **electron-builder 26.8.1 → 26.8.2**
-- **Hotkey-Validierung** — `settings-hotkey` prüft Accelerator-String gegen eine Regex-Whitelist (nur Electron-valide Modifier + Keys), verhindert Injection beliebiger Strings.
-- **Quick-Prompt-IPC-Sender-Check** — `quickprompt-submit` / `quickprompt-cancel` prüfen jetzt `event.sender === quickPromptWindow.webContents`, damit nur das eigene Fenster IPC feuern kann.
-- **Input-Längenprüfung** im Main-Process für Quick-Prompt (max. 8000 Zeichen), unabhängig vom Preload-Layer.
+- **Hotkey validation** — `settings-hotkey` checks the accelerator string against a regex whitelist (Electron-valid modifiers + keys), blocking arbitrary input.
+- **Quick-Prompt IPC sender check** — `quickprompt-submit` / `quickprompt-cancel` now verify `event.sender === quickPromptWindow.webContents`, so only the Quick-Prompt window can drive those channels.
+- **Input-length guard** in the main process for Quick-Prompt (max 8000 chars), independent of the preload layer.
 
 ---
 
-## Dateistruktur (neu in v1.3.0)
+## File layout (new in v1.3.0)
 
 ```
 claude-desktop/
-├── main.js                    # ~1660 Zeilen (+220 seit v1.2.2)
+├── main.js                    # ~1660 lines (+220 since v1.2.2)
 ├── inject/
-│   └── brand.js               # Custom Design / Recoloring
+│   └── brand.js               # Custom design / recoloring
 ├── preload-tabbar.js
-├── preload-settings.js        # NEU – Settings-Window IPC
-├── preload-quickprompt.js     # NEU – Quick-Prompt IPC
-├── preload-whatsnew.js        # NEU – What's-New IPC
-├── icon.png                   # Modern-Design
-└── icon-original.png          # Classic/Terrakotta-Design
+├── preload-settings.js        # NEW – Settings-window IPC
+├── preload-quickprompt.js     # NEW – Quick-Prompt IPC
+├── preload-whatsnew.js        # NEW – What's-New IPC
+├── icon.png                   # Modern design
+└── icon-original.png          # Classic / terracotta design
 ```
 
 ---
 
-## Abhängigkeiten
+## Dependencies
 
-| Paket | v1.2.2 | v1.3.0 | Hinweis |
-|-------|--------|--------|---------|
-| `electron` | ^41.0.4 | **^41.2.1** | 3 CVEs geschlossen |
-| `electron-builder` | ^26.8.1 | **^26.8.2** | Patch-Update |
-| `electron-updater` | ^6.8.3 | ^6.8.3 | Aktuell |
+| Package | v1.2.2 | v1.3.0 | Note |
+|---------|--------|--------|------|
+| `electron` | ^41.0.4 | **^41.2.1** | 3 CVEs closed |
+| `electron-builder` | ^26.8.1 | **^26.8.2** | Patch update |
+| `electron-updater` | ^6.8.3 | ^6.8.3 | Up to date |
 
-`npm audit` meldet **0 Vulnerabilities**.
+`npm audit` reports **0 vulnerabilities**.
 
 ---
 
-## Installation
+## Install
 
 ```bash
 chmod +x Claude-Desktop-1.3.0.AppImage
 ./Claude-Desktop-1.3.0.AppImage --no-sandbox
 ```
 
-Das `--no-sandbox`-Flag ist auf Systemen notwendig, auf denen der Chromium-SUID-Helper nicht konfiguriert ist. Der interne Web-Content-Sandbox bleibt aktiv.
+The `--no-sandbox` flag is needed on systems where the Chromium SUID helper is not configured. The in-process web-content sandbox remains active.
 
 ---
 
-## Upgrade aus v1.2.2
+## Upgrade from v1.2.2
 
-Der eingebaute Auto-Updater erkennt v1.3.0 automatisch und lädt das Update im Hintergrund. Beim nächsten Start erscheint der **Update-bereit**-Dialog. Einmalig nach dem Update wird das **What's-New**-Popup gezeigt.
+The built-in auto-updater detects v1.3.0 automatically and downloads the update in the background. The **Update ready** dialog appears on the next launch. The **What's-New** popup is shown once after the upgrade.
 
 ## Download
 
-- `Claude-Desktop-1.3.0.AppImage` — Universelles Linux-Build
-- `latest-linux.yml` — Für den Auto-Updater zwingend erforderlich, nicht weglassen
+- `Claude-Desktop-1.3.0.AppImage` — universal Linux build
+- `latest-linux.yml` — required for the auto-updater; do not omit
 
 ---
 
-## Dank & Referenzen
+## Credits & references
 
-- Interner Fehlerbericht `FEHLERBERICHT_v1.2.2.md` (alle kritischen Punkte adressiert)
-- Systematischer Deep-Code-Review für Race-Conditions, IPC-Sicherheit, Hintergrund-Performance
+- Internal bug report `FEHLERBERICHT_v1.2.2.md` (all critical items addressed)
+- Systematic deep code review for race conditions, IPC security, and background performance
 
-> **Hinweis:** Dies ist die erste Version, die System-Tray-Integration und globale Hotkeys unter Linux (X11 & Wayland) stabil unterstützt.
+> **Note:** This is the first release with stable system-tray integration and global-hotkey support on Linux (X11 & Wayland).
