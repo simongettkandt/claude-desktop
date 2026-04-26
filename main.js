@@ -1705,14 +1705,47 @@ function setupSession() {
 //  IPC-Handler
 // ═══════════════════════════════════════════════════════════════════
 
-function getAutostart() {
-  try { return !!app.getLoginItemSettings().openAtLogin; } catch { return false; }
+// Linux: Electrons setLoginItemSettings ist hier ein No-op,
+// daher schreiben wir selbst eine .desktop-Datei in ~/.config/autostart/.
+const AUTOSTART_FILE = path.join(app.getPath('home'), '.config', 'autostart', 'claude-ai-desktop.desktop');
+
+function getAutostartExec() {
+  if (process.env.APPIMAGE) return `"${process.env.APPIMAGE}" --no-sandbox`;
+  if (process.env.SNAP_NAME || process.env.SNAP) return 'claude-ai-desktop';
+  return null;
 }
+
+function getAutostart() {
+  if (process.platform !== 'linux') {
+    try { return !!app.getLoginItemSettings().openAtLogin; } catch { return false; }
+  }
+  try { return fs.existsSync(AUTOSTART_FILE); } catch { return false; }
+}
+
 function setAutostart(enabled) {
+  if (process.platform !== 'linux') {
+    try { app.setLoginItemSettings({ openAtLogin: !!enabled }); return true; }
+    catch { return false; }
+  }
   try {
-    const opts = { openAtLogin: !!enabled };
-    if (process.env.APPIMAGE) opts.path = process.env.APPIMAGE;
-    app.setLoginItemSettings(opts);
+    if (enabled) {
+      const exec = getAutostartExec();
+      if (!exec) return false;
+      fs.mkdirSync(path.dirname(AUTOSTART_FILE), { recursive: true });
+      fs.writeFileSync(AUTOSTART_FILE,
+`[Desktop Entry]
+Type=Application
+Name=Claude
+Comment=Claude AI Desktop
+Exec=${exec}
+Icon=claude-ai-desktop
+Terminal=false
+X-GNOME-Autostart-enabled=true
+`, { mode: 0o644 });
+    } else {
+      try { fs.unlinkSync(AUTOSTART_FILE); }
+      catch (e) { if (e.code !== 'ENOENT') throw e; }
+    }
     return true;
   } catch { return false; }
 }
