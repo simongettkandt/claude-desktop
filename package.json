@@ -1,6 +1,6 @@
 {
   "name": "claude-desktop",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Claude AI – Native Desktop App für Linux",
   "main": "main.js",
   "homepage": "https://github.com/simongettkandt/claude-ai-desktop-app",
@@ -43,7 +43,9 @@
     "asar": true,
     "asarUnpack": [
       "icon.png",
-      "icon-original.png"
+      "icon-original.png",
+      "icon-tray.png",
+      "icon-original-tray.png"
     ],
     "files": [
       "main.js",
@@ -51,9 +53,12 @@
       "preload-settings.js",
       "preload-quickprompt.js",
       "preload-whatsnew.js",
+      "preload-messagebox.js",
       "inject/**/*",
       "icon.png",
       "icon-original.png",
+      "icon-tray.png",
+      "icon-original-tray.png",
       "package.json",
       "node_modules/**/*",
       "!node_modules/*/{test,tests,__tests__,docs,doc,example,examples,benchmark,benchmarks}/**",

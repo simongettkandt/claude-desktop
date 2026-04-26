@@ -169,6 +169,14 @@ const RELEASE_NOTES = {
     { icon: 'bolt', title: 'Globaler Quick-Prompt', text: 'Ein frei w\u00e4hlbarer Hotkey \u00f6ffnet ein Eingabefenster f\u00fcr neue Chats \u2013 direkt aus jeder App.' },
     { icon: 'check', title: 'Update-Check mit Feedback', text: 'Das Men\u00fc zeigt jetzt klar an, ob ein Update bereitsteht oder die App aktuell ist.' },
     { icon: 'settings', title: 'App-Einstellungen', text: 'Neuer Dialog f\u00fcr Tray-Verhalten und Hotkey \u2013 jederzeit \u00fcber das Men\u00fc erreichbar.' }
+  ],
+  '1.3.1': [
+    { icon: 'check', title: 'Download-Dialog nicht mehr doppelt', text: 'Beim Speichern von Dateien aus Chats erscheint der Dialog jetzt zuverl\u00e4ssig nur einmal \u2013 auch bei Blob- und Redirect-Downloads.' },
+    { icon: 'bolt', title: 'Quick-Prompt sendet nicht mehr automatisch', text: 'Der Text wird ins Eingabefeld \u00fcbernommen und der Cursor ans Ende gesetzt. Du dr\u00fcckst selbst Enter zum Absenden.' },
+    { icon: 'settings', title: 'Dialoge zentriert \u00fcber der App', text: 'Update- und Hinweis-Dialoge \u00f6ffnen sich jetzt zuverl\u00e4ssig zentriert \u00fcber dem App-Fenster \u2013 auch auf Multi-Monitor-Setups.' },
+    { icon: 'check', title: 'Code-Tab in der Sidebar funktioniert', text: 'Der Klick auf \u201eCode\u201c in der Sidebar \u00f6ffnet die Seite jetzt korrekt in einem neuen Fenster, statt sich sofort wieder zu schlie\u00dfen.' },
+    { icon: 'tray', title: 'Tray-Icon besser erkennbar', text: 'Das Symbol in der Systemleiste zeigt jetzt das Sparkle-Logo gr\u00f6\u00dfer und transparent \u2013 deutlich sichtbar auf hellen wie dunklen Tray-Hintergr\u00fcnden.' },
+    { icon: 'bolt', title: 'Autostart beim Anmelden', text: 'Optional kann Claude jetzt automatisch beim Hochfahren des Systems starten \u2013 ein- und ausschaltbar in den App-Einstellungen.' }
   ]
 };
 
@@ -286,6 +294,7 @@ const ACCENT = {
 function theme()  { return isDarkMode ? THEME.dark : THEME.light; }
 function accent() { return customDesign ? ACCENT.custom : ACCENT.original; }
 function icon()   { return path.join(__dirname, customDesign ? 'icon.png' : 'icon-original.png'); }
+function trayIcon() { return path.join(__dirname, customDesign ? 'icon-tray.png' : 'icon-original-tray.png'); }
 
 const _iconDataUrlCache = {};
 function iconDataUrl() {
@@ -481,8 +490,11 @@ function setupView(view) {
     return { action: 'deny' };
   });
 
-  // ── OAuth-Popup Lifecycle ──
-  wc.on('did-create-window', (childWindow) => {
+  // ── OAuth-Popup Lifecycle (nur wenn das neue Fenster wirklich OAuth ist) ──
+  wc.on('did-create-window', (childWindow, details) => {
+    const initialUrl = details && details.url ? details.url : '';
+    if (!isOAuthDomain(initialUrl)) return;
+
     let closed = false;
     const cleanup = () => {
       if (closed || childWindow.isDestroyed()) return;
@@ -509,7 +521,13 @@ function setupView(view) {
 
   // ── Navigation Guards ──
   wc.on('will-navigate', (event, navUrl) => {
-    if (!isAllowedDomain(navUrl) && !isOAuthDomain(navUrl)) event.preventDefault();
+    if (!isAllowedDomain(navUrl) && !isOAuthDomain(navUrl)) {
+      event.preventDefault();
+      try {
+        const p = new URL(navUrl).protocol;
+        if (p === 'https:' || p === 'http:') shell.openExternal(navUrl);
+      } catch {}
+    }
   });
 
   wc.on('will-frame-navigate', (event) => {
@@ -713,8 +731,8 @@ function toggleDesign() {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setIcon(icon());
   if (tray) {
     try {
-      const img = nativeImage.createFromPath(icon());
-      tray.setImage(img.isEmpty() ? icon() : img);
+      const img = nativeImage.createFromPath(trayIcon());
+      tray.setImage(img.isEmpty() ? trayIcon() : img);
     } catch {}
   }
   try { fs.copyFileSync(icon(), path.join(app.getPath('home'), 'Apps', 'claude-desktop-icon.png')); } catch {}
@@ -895,6 +913,9 @@ function openQuickPrompt() {
   quickPromptWindow.on('closed', () => { quickPromptWindow = null; });
 }
 
+// Quick-Prompt: Text in Eingabefeld einfügen und Cursor positionieren.
+// Bewusst KEIN Auto-Submit: kein Button-Klick, kein synthetisches KeyboardEvent.
+// User drückt selbst Enter zum Absenden – konsistent mit dem "passiver Wrapper"-Prinzip.
 function submitQuickPrompt(text) {
   if (typeof text !== 'string') return;
   const trimmed = text.trim();
@@ -910,8 +931,10 @@ function submitQuickPrompt(text) {
       let attempts = 0;
       const tryFill = () => {
         attempts++;
-        if (attempts > 80) return;
-        const el = document.querySelector('div[contenteditable="true"].ProseMirror') || document.querySelector('div[contenteditable="true"]') || document.querySelector('.ProseMirror');
+        if (attempts > 40) return; // ~6s max
+        const el = document.querySelector('div[contenteditable="true"].ProseMirror')
+                || document.querySelector('div[contenteditable="true"]')
+                || document.querySelector('.ProseMirror');
         if (!el) { setTimeout(tryFill, 150); return; }
         try {
           el.focus();
@@ -921,17 +944,13 @@ function submitQuickPrompt(text) {
           sel.removeAllRanges();
           sel.addRange(range);
           document.execCommand('insertText', false, prompt);
+          // Cursor ans Ende setzen, damit Enter direkt sendet
+          const end = document.createRange();
+          end.selectNodeContents(el);
+          end.collapse(false);
+          sel.removeAllRanges();
+          sel.addRange(end);
         } catch(e) {}
-        setTimeout(() => {
-          const btns = Array.from(document.querySelectorAll('button'));
-          const btn = btns.find(b => {
-            const a = (b.getAttribute('aria-label') || '').toLowerCase();
-            return a.includes('send') || a.includes('senden') || a.includes('abschicken');
-          });
-          if (btn && !btn.disabled) { btn.click(); return; }
-          const enter = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
-          (el || document.activeElement).dispatchEvent(enter);
-        }, 250);
       };
       tryFill();
     })();`).catch(() => {});
@@ -960,8 +979,8 @@ function centerOnMainDisplay(width, height) {
 function setupTray() {
   if (tray) return;
   try {
-    const img = nativeImage.createFromPath(icon());
-    tray = new Tray(img.isEmpty() ? icon() : img);
+    const img = nativeImage.createFromPath(trayIcon());
+    tray = new Tray(img.isEmpty() ? trayIcon() : img);
     if (!img.isEmpty()) tray.setImage(img);
     tray.setToolTip('Claude');
     tray.on('click', toggleMainWindow);
@@ -1006,6 +1025,8 @@ function getSettingsHTML() {
     subtitle: t('Hintergrund-Modus und globaler Hotkey', 'Background mode and global hotkey'),
     minimizeLabel: t('Beim Schlie\u00dfen in den Hintergrund minimieren', 'Minimize to tray on close'),
     minimizeHint: t('Claude bleibt im Hintergrund erreichbar \u2013 \u00fcber das Tray-Symbol oder den Hotkey unten.', 'Claude stays reachable in the background \u2013 via the tray icon or the hotkey below.'),
+    autostartLabel: t('Beim Anmelden automatisch starten', 'Start automatically at login'),
+    autostartHint: t('Claude startet beim Hochfahren des Systems automatisch.', 'Claude launches automatically when the system starts.'),
     hotkeyLabel: t('Globaler Hotkey (neuer Chat)', 'Global hotkey (new chat)'),
     press: t('Klick hier und dr\u00fccke eine Tastenkombination', 'Click here and press a key combination'),
     pressing: t('Dr\u00fccke die gew\u00fcnschte Tastenkombination\u2026', 'Press your key combination\u2026'),
@@ -1046,6 +1067,11 @@ button:hover{filter:brightness(1.05)}
 </div>
 
 <div class="row">
+  <label class="chk"><input type="checkbox" id="as"><span>${i18n.autostartLabel}</span></label>
+  <div class="hint">${i18n.autostartHint}</div>
+</div>
+
+<div class="row">
   <label>${i18n.hotkeyLabel}</label>
   <div class="hotkey">
     <div class="capture" id="cap" tabindex="0">${i18n.press}</div>
@@ -1062,6 +1088,7 @@ button:hover{filter:brightness(1.05)}
 const I = ${JSON.stringify(i18n)};
 const api = window.settingsAPI;
 const mc = document.getElementById('mc');
+const as = document.getElementById('as');
 const cap = document.getElementById('cap');
 const clearBtn = document.getElementById('clear');
 const closeBtn = document.getElementById('close');
@@ -1077,10 +1104,12 @@ function resetCapture() {
 
 api.get().then(s => {
   mc.checked = !!s.minimizeOnClose;
+  as.checked = !!s.autostart;
   if (s.hotkey) { currentDisplay = s.hotkey; cap.textContent = s.hotkey; }
 });
 
 mc.addEventListener('change', () => api.setMinimize(mc.checked));
+as.addEventListener('change', () => api.setAutostart(as.checked));
 
 cap.addEventListener('click', () => {
   listening = true;
@@ -1248,6 +1277,136 @@ function openSettingsWindow() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  Custom MessageBox – zentriert über der App statt GTK-nativ
+// ═══════════════════════════════════════════════════════════════════
+
+let _msgboxCounter = 0;
+
+function showCustomMessageBox(opts) {
+  const id = ++_msgboxCounter;
+  const channel = `msgbox-respond-${id}`;
+  const type = opts.type || 'info';
+  const title = opts.title || 'Claude';
+  const message = opts.message || '';
+  const detail = opts.detail || '';
+  const buttons = (Array.isArray(opts.buttons) && opts.buttons.length) ? opts.buttons : ['OK'];
+  const defaultId = typeof opts.defaultId === 'number' ? opts.defaultId : 0;
+  const cancelId = typeof opts.cancelId === 'number' ? opts.cancelId : (buttons.length - 1);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (index) => {
+      if (settled) return;
+      settled = true;
+      ipcMain.removeAllListeners(channel);
+      resolve({ response: typeof index === 'number' ? index : cancelId });
+    };
+
+    const size = { width: 480, height: detail ? 260 : 200 };
+    const pos = centerOnMainDisplay(size.width, size.height);
+    const parentWin = (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) ? mainWindow : undefined;
+
+    const win = new BrowserWindow({
+      ...size, ...pos,
+      parent: parentWin,
+      modal: !!parentWin,
+      resizable: false, minimizable: false, maximizable: false,
+      title,
+      backgroundColor: theme().bg,
+      icon: icon(),
+      autoHideMenuBar: true,
+      webPreferences: {
+        preload: path.join(__dirname, 'preload-messagebox.js'),
+        nodeIntegration: false, contextIsolation: true, sandbox: true,
+        spellcheck: false
+      }
+    });
+    win.setMenu(null);
+
+    ipcMain.once(channel, (_, index) => {
+      finish(index);
+      if (!win.isDestroyed()) win.close();
+    });
+
+    win.on('closed', () => finish(cancelId));
+
+    const html = getMessageBoxHTML({ type, title, message, detail, buttons, defaultId, cancelId, channel });
+    win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+  });
+}
+
+function getMessageBoxHTML({ type, title, message, detail, buttons, defaultId, cancelId, channel }) {
+  const th = theme();
+  const ac = accent();
+  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  const iconColor = type === 'error' ? '#e05e3e' : (type === 'warning' ? '#e0a93e' : ac.from);
+  const iconSvg = {
+    info:    '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
+    warning: '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+    error:   '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>'
+  }[type] || '';
+  const buttonsHtml = buttons.map((label, i) => {
+    const primary = i === defaultId;
+    return `<button class="btn${primary ? ' primary' : ''}" data-idx="${i}">${esc(label)}</button>`;
+  }).join('');
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${esc(title)}</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; padding: 0; }
+  body { background: ${th.bg}; color: ${th.textActive}; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; font-size: 14px; user-select: none; -webkit-user-select: none; }
+  .container { display: flex; flex-direction: column; height: 100%; padding: 22px; }
+  .top { display: flex; gap: 16px; flex: 1; align-items: flex-start; min-height: 0; }
+  .icon { color: ${iconColor}; flex: 0 0 auto; line-height: 0; }
+  .content { flex: 1; min-width: 0; }
+  .msg { font-weight: 500; margin: 0 0 8px; line-height: 1.4; word-wrap: break-word; }
+  .detail { color: ${th.text}; font-size: 13px; line-height: 1.4; white-space: pre-wrap; word-wrap: break-word; max-height: 120px; overflow-y: auto; }
+  .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; flex: 0 0 auto; }
+  .btn { background: ${th.bgHover}; color: ${th.textActive}; border: 1px solid ${th.border}; border-radius: 6px; padding: 7px 16px; font-size: 13px; cursor: pointer; font-family: inherit; min-width: 80px; }
+  .btn:hover { background: ${th.bgActive}; }
+  .btn.primary { background: linear-gradient(135deg, ${ac.from}, ${ac.to}); color: #fff; border-color: transparent; font-weight: 500; }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn:focus { outline: 2px solid ${ac.from}; outline-offset: 2px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="top">
+    <div class="icon">${iconSvg}</div>
+    <div class="content">
+      <div class="msg">${esc(message)}</div>
+      ${detail ? `<div class="detail">${esc(detail)}</div>` : ''}
+    </div>
+  </div>
+  <div class="buttons">${buttonsHtml}</div>
+</div>
+<script>
+(function(){
+  const channel = ${JSON.stringify(channel)};
+  const defaultIdx = ${defaultId};
+  const cancelIdx = ${cancelId};
+  const respond = (i) => { try { window.msgboxAPI.respond(channel, i); } catch (e) {} };
+  document.querySelectorAll('.btn').forEach(b => {
+    b.addEventListener('click', () => respond(parseInt(b.dataset.idx, 10)));
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); respond(cancelIdx); }
+    else if (e.key === 'Enter') { e.preventDefault(); respond(defaultIdx); }
+  });
+  setTimeout(() => {
+    const primary = document.querySelector('.btn.primary') || document.querySelector('.btn');
+    if (primary) primary.focus();
+  }, 50);
+})();
+</script>
+</body>
+</html>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  Menü
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1284,7 +1443,7 @@ function updateMenu(force = false) {
         { label: `Design: ${customDesign ? 'Modern' : 'Classic'}`, click: toggleDesign },
         { label: t('Nach Updates suchen\u2026', 'Check for Updates\u2026'), click: () => {
           if (isDev) {
-            dialog.showMessageBox(mainWindow, { type: 'info', title: 'Claude', message: t('Updates sind im Entwicklungsmodus deaktiviert.', 'Updates are disabled in development mode.') });
+            showCustomMessageBox({ type: 'info', title: 'Claude', message: t('Updates sind im Entwicklungsmodus deaktiviert.', 'Updates are disabled in development mode.') });
             return;
           }
           manualUpdateCheck = true;
@@ -1376,14 +1535,52 @@ function showOfflinePage() {
 // ═══════════════════════════════════════════════════════════════════
 
 function setupDownloadManager() {
+  // Lock-basierte Deduplizierung: ein Download pro fileName gleichzeitig,
+  // plus kurzer Cooldown nach Abschluss gegen Nach-Echo-Events.
+  const activeDownloads = new Set();     // fileName -> während Dialog offen / Download läuft
+  const cooldownUntil = new Map();       // fileName -> Ablaufzeit (ms)
+  const COOLDOWN_MS = 3000;
+
   session.fromPartition('persist:claude').on('will-download', (_, item) => {
     const fileName = item.getFilename();
-    const savePath = dialog.showSaveDialogSync(mainWindow, {
+    const now = Date.now();
+
+    // Cooldown: kürzlich abgeschlossener Download mit gleichem Namen → Echo droppen
+    const until = cooldownUntil.get(fileName);
+    if (until && now < until) { item.cancel(); return; }
+    if (until) cooldownUntil.delete(fileName);
+
+    // Aktiver Download mit gleichem Namen → Duplikat droppen
+    if (activeDownloads.has(fileName)) { item.cancel(); return; }
+    activeDownloads.add(fileName);
+
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      activeDownloads.delete(fileName);
+      cooldownUntil.set(fileName, Date.now() + COOLDOWN_MS);
+      setTimeout(() => {
+        const u = cooldownUntil.get(fileName);
+        if (u && Date.now() >= u) cooldownUntil.delete(fileName);
+      }, COOLDOWN_MS + 200);
+    };
+
+    // Async-Dialog (blockiert den Event-Loop nicht)
+    dialog.showSaveDialog(mainWindow, {
       defaultPath: path.join(app.getPath('downloads'), fileName),
       filters: [{ name: t('Alle Dateien', 'All Files'), extensions: ['*'] }]
+    }).then(result => {
+      if (result.canceled || !result.filePath) {
+        item.cancel();
+        release();
+        return;
+      }
+      item.setSavePath(result.filePath);
+    }).catch(() => {
+      item.cancel();
+      release();
     });
-    if (!savePath) { item.cancel(); return; }
-    item.setSavePath(savePath);
 
     item.on('updated', (_, state) => {
       if (state === 'progressing' && !item.isPaused() && mainWindow && !mainWindow.isDestroyed()) {
@@ -1400,6 +1597,7 @@ function setupDownloadManager() {
       if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.setProgressBar(-1); updateTitle(); }
       if (state === 'completed') new Notification({ title: t('Download fertig', 'Download complete'), body: fileName }).show();
       else if (state !== 'cancelled') new Notification({ title: t('Download fehlgeschlagen', 'Download failed'), body: fileName }).show();
+      release();
     });
   });
 }
@@ -1422,7 +1620,7 @@ function setupAutoUpdater() {
     failures = 0;
     if (manualUpdateCheck) {
       manualUpdateCheck = false;
-      dialog.showMessageBox(dialogParent(), { type: 'info', title: t('Update verf\u00fcgbar', 'Update available'), message: `v${info.version} ${t('wird heruntergeladen\u2026', 'is downloading\u2026')}` });
+      showCustomMessageBox({ type: 'info', title: t('Update verf\u00fcgbar', 'Update available'), message: `v${info.version} ${t('wird heruntergeladen\u2026', 'is downloading\u2026')}` });
     } else {
       new Notification({ title: t('Update verf\u00fcgbar', 'Update available'), body: `v${info.version} ${t('wird geladen\u2026', 'downloading\u2026')}` }).show();
     }
@@ -1432,7 +1630,7 @@ function setupAutoUpdater() {
     failures = 0;
     if (manualUpdateCheck) {
       manualUpdateCheck = false;
-      dialog.showMessageBox(dialogParent(), { type: 'info', title: t('Kein Update', 'No Update'), message: t('Du verwendest bereits die neueste Version.', 'You are already on the latest version.'), detail: `v${app.getVersion()}` });
+      showCustomMessageBox({ type: 'info', title: t('Kein Update', 'No Update'), message: t('Du verwendest bereits die neueste Version.', 'You are already on the latest version.'), detail: `v${app.getVersion()}` });
     }
   });
 
@@ -1445,11 +1643,11 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-downloaded', (info) => {
     if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.setTitle('Claude'); mainWindow.setProgressBar(-1); }
-    if (dialog.showMessageBoxSync(dialogParent(), {
+    showCustomMessageBox({
       type: 'info', title: t('Update bereit', 'Update ready'),
       message: `v${info.version} ${t('heruntergeladen. Jetzt neu starten?', 'downloaded. Restart now?')}`,
-      buttons: [t('Neu starten', 'Restart'), t('Sp\u00e4ter', 'Later')], defaultId: 0
-    }) === 0) autoUpdater.quitAndInstall();
+      buttons: [t('Neu starten', 'Restart'), t('Sp\u00e4ter', 'Later')], defaultId: 0, cancelId: 1
+    }).then(r => { if (r.response === 0) autoUpdater.quitAndInstall(); });
   });
 
   autoUpdater.on('error', (err) => {
@@ -1458,7 +1656,7 @@ function setupAutoUpdater() {
     if (manualUpdateCheck) {
       manualUpdateCheck = false;
       const short = (err.message || '').split('\n')[0].slice(0, 200);
-      dialog.showMessageBox(dialogParent(), { type: 'error', title: t('Update-Fehler', 'Update Error'), message: t('Update-Pr\u00fcfung fehlgeschlagen.', 'Update check failed.'), detail: short });
+      showCustomMessageBox({ type: 'error', title: t('Update-Fehler', 'Update Error'), message: t('Update-Pr\u00fcfung fehlgeschlagen.', 'Update check failed.'), detail: short });
     }
   });
 
@@ -1507,11 +1705,28 @@ function setupSession() {
 //  IPC-Handler
 // ═══════════════════════════════════════════════════════════════════
 
-ipcMain.handle('settings-get', () => ({ minimizeOnClose, hotkey: currentHotkey }));
+function getAutostart() {
+  try { return !!app.getLoginItemSettings().openAtLogin; } catch { return false; }
+}
+function setAutostart(enabled) {
+  try {
+    const opts = { openAtLogin: !!enabled };
+    if (process.env.APPIMAGE) opts.path = process.env.APPIMAGE;
+    app.setLoginItemSettings(opts);
+    return true;
+  } catch { return false; }
+}
+
+ipcMain.handle('settings-get', () => ({
+  minimizeOnClose,
+  hotkey: currentHotkey,
+  autostart: getAutostart()
+}));
 ipcMain.on('settings-minimize', (_, v) => {
   minimizeOnClose = v === true;
   saveWindowState();
 });
+ipcMain.handle('settings-autostart', (_, v) => setAutostart(v === true));
 const HOTKEY_RE = /^(?:(?:Command|Cmd|Control|Ctrl|CommandOrControl|CmdOrCtrl|Alt|Option|AltGr|Shift|Super|Meta)\+)*[A-Za-z0-9]+$|^(?:(?:Command|Cmd|Control|Ctrl|CommandOrControl|CmdOrCtrl|Alt|Option|AltGr|Shift|Super|Meta)\+)*(?:F1[0-9]?|F20|F[1-9]|Plus|Space|Tab|Backspace|Delete|Insert|Return|Enter|Up|Down|Left|Right|Home|End|PageUp|PageDown|Escape|Esc|VolumeUp|VolumeDown|VolumeMute|MediaPlayPause|PrintScreen|numdec|numadd|numsub|nummult|numdiv|num[0-9])$/;
 
 ipcMain.handle('settings-hotkey', (_, accel) => {
