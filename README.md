@@ -53,7 +53,7 @@ Snap updates are handled automatically by `snapd` – no action needed.
 
 ### AppImage (all Linux distros)
 
-Download the latest `.AppImage` from [Releases](https://github.com/simongettkandt/claude-ai-desktop-app/releases):
+Download the latest `.AppImage` from [Releases](https://github.com/simonlinuxcraft/claude-ai-desktop-app/releases):
 
 ```bash
 chmod +x Claude-Desktop-*.AppImage
@@ -87,7 +87,7 @@ EOF
 ### From source
 
 ```bash
-git clone https://github.com/simongettkandt/claude-ai-desktop-app.git
+git clone https://github.com/simonlinuxcraft/claude-ai-desktop-app.git
 cd claude-ai-desktop-app
 npm install
 npm start
